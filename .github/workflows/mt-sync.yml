@@ -1,0 +1,41 @@
+name: MT → Shopify Order Transfer
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # every 4 hours (UTC)
+  workflow_dispatch:        # manual "Run workflow" button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: mt-shopify-sync
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          WHOAMI: ${{ secrets.WHOAMI }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+        run: python shopify-orders-all-open.py
+
+      # Optional: collect any CSVs you create in /exports
+      - name: Upload exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt-exports
+          path: exports/*.csv
+          if-no-files-found: ignore
