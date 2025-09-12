@@ -674,6 +674,8 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     # --- B2B metafields from MarketTime -> Shopify draft order
     ship_date_val = _to_yyyy_mm_dd(order.get("shipDate"))
     bill_to_email_val = (order.get("billToEmail") or "").strip() or None
+    po_num_val = (order.get("poNumber") or "").strip() or None
+
 
     metafields = []
     if ship_date_val:
@@ -689,6 +691,14 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
             "key": "bill_to_email",
             "value": bill_to_email_val,
             # If definitions aren't present, you may need: "type": "single_line_text_field"
+        })
+    if po_num_val:
+        metafields.append({
+            "namespace": "b2b",
+            "key": "po_number",
+            "value": po_num_val,
+            # If your store requires typed metafields at creation time, add:
+            # "type": "single_line_text_field"
         })
 
     input_obj = {
@@ -936,3 +946,4 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
