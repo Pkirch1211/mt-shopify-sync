@@ -7,6 +7,7 @@ import requests
 from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from datetime import datetime, UTC
+from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
 
 """
 Shopify <> MarketTime sync — hardened (POST + offset/limit paging)
@@ -27,6 +28,12 @@ Additional change (2025-09-09):
 - Map MarketTime -> Shopify Draft metafields:
   - b2b.ship_date  = order.shipDate (normalized to YYYY-MM-DD)
   - b2b.bill_to_email = order.billToEmail
+
+Additional change (2025-09-13):
+- **STRONG de-dupe** before creating a draft:
+  1) Orders by po_number (GraphQL)
+  2) Draft Orders by po_number / tag (GraphQL)
+  3) Draft Orders paginated via REST (open + invoice_sent) with Link headers
 """
 
 # -------------------- Config & setup --------------------
@@ -41,7 +48,7 @@ if not API_KEY or not WHOAMI or not SHOPIFY_TOKEN or not SHOPIFY_STORE:
 
 SHOPIFY_BASE = f"https://{SHOPIFY_STORE.strip('/')}" if not SHOPIFY_STORE.startswith("http") else SHOPIFY_STORE.rstrip("/")
 SHOPIFY_API_VERSION = "2024-10"
-HTTP_TIMEOUT = 20
+HTTP_TIMEOUT = 25
 
 # MT tenant specifics
 SERVER_LIMIT = 50          # confirmed cap for your tenant
@@ -56,8 +63,8 @@ PO_WHITELIST = None
 
 # Shopify draft de-dupe scan controls
 REST_PAGE_LIMIT = 250
-MAX_PAGES_PER_STATUS = 8
-REST_PAGE_SLEEP = 0.05
+MAX_PAGES_PER_STATUS = 100
+REST_PAGE_SLEEP = 0.03
 
 # Paths
 EXPORT_DIR = "exports"
@@ -160,23 +167,19 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
     s = str(val).strip()
     if not s:
         return None
-    # ISO date or datetime
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
     except Exception:
         pass
-    # YYYY-MM-DD (take the date part)
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    # MM/DD/YYYY
     m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
     if m:
         try:
             return datetime(int(m.group(3)), int(m.group(1)), int(m.group(2))).date().isoformat()
         except Exception:
             pass
-    # Fallback: first 10 chars (best-effort)
     return s[:10]
 
 # -------------------- Catalog helper --------------------
@@ -299,9 +302,8 @@ def to_company_address_input(order: dict, kind: str) -> dict:
 def ensure_company_location(company_id: str, name: str, order: dict) -> str | None:
     """
     Find or create the company location.
-    NEW: If the company only has a single, blank auto-created location, reuse it:
-         - assign addresses
-         - try to rename to the desired 'name' (non-blocking)
+    If the company only has a single, blank auto-created location, reuse it:
+    assign addresses and try to rename to the desired 'name' (non-blocking)
     """
     key = (company_id, name or "Default")
     if key in _location_id_cache:
@@ -355,12 +357,9 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
         current_name = (n.get("name") or "").strip()
         ship_has = bool((n.get("shippingAddress") or {}).get("address1"))
         bill_has = bool((n.get("billingAddress") or {}).get("address1"))
-
-        # Consider it "generic" if named same as company or "Default"
         is_generic_name = current_name.lower() in {company_name.strip().lower(), "default"}
 
         if is_generic_name and (not ship_has and not bill_has):
-            # assign addresses
             try:
                 m = """mutation($locationId: ID!, $address: CompanyAddressInput!, $types: [CompanyAddressType!]!) {
                         companyLocationAssignAddress(locationId: $locationId, address: $address, addressTypes: $types) {
@@ -371,7 +370,6 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
             except Exception:
                 pass
 
-            # try to rename (non-blocking; API schema differs across stores)
             try:
                 mu = """
                 mutation($id: ID!, $input: CompanyLocationUpdateInput!) {
@@ -382,7 +380,6 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
                 }"""
                 shopify_graphql(mu, {"id": lid, "input": {"name": desired_name}})
             except Exception:
-                # rename is best-effort; ignore failures
                 pass
 
             _location_id_cache[key] = lid
@@ -434,9 +431,7 @@ def iterate_company_contacts(company_id: str):
             break
 
 def get_or_create_matching_contact(company_id: str, customer_id_numeric: int | str) -> str | None:
-    """Return the companyContact ID whose customer == this Customer; create or fetch existing."""
     target_gid = to_gid("Customer", customer_id_numeric)
-
     for cid, cust_gid in iterate_company_contacts(company_id):
         if cust_gid == target_gid:
             return cid
@@ -558,13 +553,107 @@ def fetch_all_mt_orders() -> list[dict]:
             print(f"MT total returned: {len(all_orders)} rows.")
     return all_orders
 
-# -------------------- PO de-dupe --------------------
+# -------------------- PO de-dupe (HARDENED) --------------------
+def _draft_exists_graphql(po: str, mt_record_id: str | None) -> bool:
+    """
+    Fast, targeted GraphQL checks for draft orders by PO number and by tag.
+    Tries both quoted and unquoted search to be robust with '#'.
+    """
+    try:
+        for pattern in (f'po_number:"{po}"', f"po_number:{po}"):
+            q = """
+            query($q: String!) {
+              draftOrders(first: 1, query: $q) {
+                edges { node { id poNumber tags } }
+              }
+            }"""
+            res = shopify_graphql(q, {"q": pattern})
+            edges = (((res.get("data", {}) or {}).get("draftOrders", {}) or {}).get("edges", []) or [])
+            for e in edges:
+                node = e.get("node", {}) or {}
+                if norm_po(node.get("poNumber")) == norm_po(po):
+                    print("  · Found existing draft by GraphQL PO search")
+                    return True
+                if mt_record_id:
+                    tags = node.get("tags") or []
+                    tag_blob = ",".join(tags) if isinstance(tags, list) else str(tags)
+                    if f"mt_recordID:{mt_record_id}" in tag_blob:
+                        print("  · Found existing draft by GraphQL tag search (mt_recordID)")
+                        return True
+        if mt_record_id:
+            q2 = """
+            query($q: String!) {
+              draftOrders(first: 1, query: $q) {
+                edges { node { id } }
+              }
+            }"""
+            # Search by explicit tag key:value (quoted)
+            res2 = shopify_graphql(q2, {"q": f'tag:"mt_recordID:{mt_record_id}"'})
+            if (((res2.get("data", {}) or {}).get("draftOrders", {}) or {}).get("edges", [])):
+                print("  · Found existing draft by GraphQL tag query")
+                return True
+    except Exception:
+        pass
+    return False
+
+def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
+    """
+    Fully paginate draft orders (open + invoice_sent) via REST using Link headers.
+    Stop if we find a matching PO or mt_recordID tag, or if we hit page cap.
+    """
+    base = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
+    fields = "id,po_number,tags,created_at"
+    for status in ("open", "invoice_sent"):
+        params = {"status": status, "limit": REST_PAGE_LIMIT, "fields": fields}
+        url = base
+        pages = 0
+        while True:
+            pages += 1
+            try:
+                r = requests.get(url, headers=shopify_rest_headers, params=params, timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+            except Exception as e:
+                print(f"(non-blocking) REST draft scan failed (status={status}, page={pages}): {e}")
+                break
+
+            for d in (r.json().get("draft_orders") or []):
+                po_shop = norm_po(d.get("po_number"))
+                if po_shop and po_shop == target_po_norm:
+                    print(f"  · Found existing draft via REST (status={status}, page={pages})")
+                    return True
+                if mt_record_id and f"mt_recordID:{mt_record_id}" in (d.get("tags") or ""):
+                    print(f"  · Found existing draft by REST tag (status={status}, page={pages})")
+                    return True
+
+            link = r.headers.get("Link") or ""
+            if 'rel="next"' not in link:
+                break
+
+            try:
+                next_part = [p for p in link.split(",") if 'rel="next"' in p][0]
+                next_url = next_part[next_part.find("<")+1 : next_part.find(">")]
+                pu = urlparse(next_url)
+                url = f"{pu.scheme}://{pu.netloc}{pu.path}"
+                q = parse_qs(pu.query)
+                params = {"status": status, "limit": REST_PAGE_LIMIT, "fields": fields, "page_info": q.get("page_info", [""])[0]}
+            except Exception:
+                break
+
+            if pages >= MAX_PAGES_PER_STATUS:
+                print(f"(non-blocking) REST draft scan reached page cap ({MAX_PAGES_PER_STATUS}) for status={status}")
+                break
+
+            time.sleep(REST_PAGE_SLEEP)
+    return False
+
 def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
-    """True if a Shopify Order or any Draft already carries this PO (normalized),
-    or if we find a draft tagged with mt_recordID:<id>."""
+    """
+    True if a Shopify Order or any Draft already carries this PO (normalized),
+    or if we find a draft tagged with mt_recordID:<id>.
+    """
     target = norm_po(po)
 
-    # Orders via GraphQL
+    # Orders via GraphQL (fast)
     try:
         q = """
         query($q: String!) {
@@ -577,30 +666,17 @@ def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
         for e in edges:
             n = e.get("node", {}) or {}
             if norm_po(n.get("poNumber")) == target:
+                print("  · Found existing Shopify ORDER by PO")
                 return True
     except Exception:
         pass
 
-    # Drafts via REST
-    for status in ("open", "invoice_sent"):
-        try:
-            r = requests.get(
-                f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json",
-                headers=shopify_rest_headers,
-                params={"status": status, "limit": REST_PAGE_LIMIT, "fields": "id,po_number,tags"},
-                timeout=HTTP_TIMEOUT,
-            )
-            r.raise_for_status()
-            for d in r.json().get("draft_orders", []) or []:
-                po_shop = norm_po(d.get("po_number"))
-                if po_shop and po_shop == target:
-                    return True
-                if mt_record_id and f"mt_recordID:{mt_record_id}" in (d.get("tags") or ""):
-                    return True
-        except Exception as e:
-            print(f"(non-blocking) REST draft scan failed for status={status}: {e}")
+    # Drafts via GraphQL (fast targeted query)
+    if _draft_exists_graphql(po, mt_record_id):
+        return True
 
-    return False
+    # Drafts via REST (full pagination fallback)
+    return _rest_draft_exists(target, mt_record_id)
 
 # -------------------- Draft creation --------------------
 def to_mailing_address(order: dict, kind: str) -> dict:
@@ -676,35 +752,17 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     bill_to_email_val = (order.get("billToEmail") or "").strip() or None
     po_num_val = (order.get("poNumber") or "").strip() or None
 
-
     metafields = []
     if ship_date_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "ship_date",
-            "value": ship_date_val,
-            # If definitions aren't present, you may need: "type": "date"
-        })
+        metafields.append({"namespace": "b2b", "key": "ship_date", "value": ship_date_val})
     if bill_to_email_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "bill_to_email",
-            "value": bill_to_email_val,
-            # If definitions aren't present, you may need: "type": "single_line_text_field"
-        })
+        metafields.append({"namespace": "b2b", "key": "bill_to_email", "value": bill_to_email_val})
     if po_num_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "po_number",
-            "value": po_num_val,
-            # If your store requires typed metafields at creation time, add:
-            # "type": "single_line_text_field"
-        })
+        metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
     input_obj = {
         "lineItems": line_items,
         "note": " | ".join([p for p in note_parts if p]),
-        # removed BillToName/company tag to avoid 40-char limit issues
         "tags": tags,
         "billingAddress": to_mailing_address(order, "billing"),
         "shippingAddress": to_mailing_address(order, "shipping"),
@@ -778,11 +836,8 @@ def find_customer_by_name_company(first: str | None, last: str | None, company: 
 
 # -------------------- Fetch MarketTime orders + process --------------------
 orders_all = fetch_all_mt_orders()
-
-# Only OPEN orders
 open_orders = [o for o in orders_all if str(o.get("manufacturerOrderStatus", "")).upper() == "OPEN"]
 
-# Optional PO whitelist
 if PO_WHITELIST:
     open_orders = [o for o in open_orders if str(o.get("poNumber")) in PO_WHITELIST]
     print(f"PO whitelist active: {sorted(PO_WHITELIST)} -> {len(open_orders)} open orders in scope")
@@ -798,7 +853,6 @@ _seen_pos: set[str] = set()
 exported_rows = []
 
 def _default_ship_country_us(order: dict):
-    """If shipToCountry is blank or missing, force 'US' and log."""
     val = (order.get("shipToCountry") or "").strip()
     if not val:
         order["shipToCountry"] = "US"
