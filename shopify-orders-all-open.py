@@ -67,7 +67,7 @@ RETRY_SLEEP_SECS = 2
 LOG_TIMINGS = True
 
 # Optional PO whitelist; set to set([...]) or None
-PO_WHITELIST = {"9679073-CL"}
+PO_WHITELIST = None
 
 # Shopify draft de-dupe scan controls
 REST_PAGE_LIMIT = 250
@@ -1082,3 +1082,4 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
