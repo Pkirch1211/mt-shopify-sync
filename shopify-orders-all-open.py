@@ -34,6 +34,14 @@ Additional change (2025-09-13):
   1) Orders by po_number (GraphQL)
   2) Draft Orders by po_number / tag (GraphQL)
   3) Draft Orders paginated via REST (open + invoice_sent) with Link headers
+
+Additional change (2025-09-21):
+- Manual “assortment expansion” for 4 parent SKUs (LL-DISP-FA1, LL-DISP-FA2, LL-DISP-WR1, LL-DISP-WR2).
+  If a parent is found in an order, replace it with its child SKUs and multiply quantities
+  by the parent’s ordered quantity. For each child:
+    • If Shopify variant exists → add by variant (Shopify price is used)
+    • Else → add custom line with fallback price from your table.
+  No tag or note is added about the expansion.
 """
 
 # -------------------- Config & setup --------------------
@@ -59,7 +67,7 @@ RETRY_SLEEP_SECS = 2
 LOG_TIMINGS = True
 
 # Optional PO whitelist; set to set([...]) or None
-PO_WHITELIST = None
+PO_WHITELIST = {"9679073-CL"}
 
 # Shopify draft de-dupe scan controls
 REST_PAGE_LIMIT = 250
@@ -181,6 +189,60 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
         except Exception:
             pass
     return s[:10]
+
+# -------------------- Assortment expansion (manual map + fallback prices) --------------------
+# Each parent maps to list of (child_sku, qty_per_one_parent, fallback_unit_price)
+ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
+    "LL-DISP-FA1": [
+        ("165005", 8, 6.50),
+        ("165007", 8, 6.50),
+        ("165008", 8, 6.50),
+        ("165009", 4, 6.50),
+        ("165012", 4, 6.50),
+        ("LL-99-3087", 1, 0.00),
+    ],
+    "LL-DISP-FA2": [
+        ("165005", 16, 6.50),
+        ("165006", 8, 6.50),
+        ("165007", 12, 6.50),
+        ("165008", 16, 6.50),
+        ("165009", 8, 6.50),
+        ("165012", 8, 6.50),
+        ("165014", 4, 6.50),
+        ("LL-00-0004", 1, 0.00),
+    ],
+    "LL-DISP-WR1": [
+        ("11-2501", 6, 6.50),
+        ("11-2502", 6, 6.50),
+        ("11-2507", 4, 6.50),
+        ("11-2508-V2", 6, 10.00),
+        ("LL-12-3102", 4, 10.00),
+        ("LL-12-3121", 4, 6.50),
+        ("LL-12-3124", 4, 6.50),
+        ("11-2521-CP12", 4, 6.50),
+        ("LL-12-3066-CP12", 4, 6.50),
+        ("99-9504", 1, 0.00),
+    ],
+    "LL-DISP-WR2": [
+        ("11-2501", 6, 6.50),
+        ("11-2504", 6, 6.50),
+        ("LL-12-3121", 8, 6.50),
+        ("LL-12-3123", 8, 6.50),
+        ("LL-12-3124", 4, 6.50),
+        ("99-9504", 1, 0.00),
+    ],
+}
+
+def is_assortment_parent(sku: str | None) -> bool:
+    return (sku or "") in ASSORTMENT_MAP
+
+def expand_assortment_children(parent_sku: str, parent_qty: int) -> list[tuple[str, int, float]]:
+    """
+    Return list of (child_sku, expanded_qty, fallback_unit_price) based on map * parent_qty.
+    """
+    base = ASSORTMENT_MAP.get(parent_sku, [])
+    q = int(parent_qty or 0)
+    return [(child, per * q, fallback) for (child, per, fallback) in base]
 
 # -------------------- Catalog helper --------------------
 _variant_by_sku_cache: dict[str, str] = {}
@@ -587,7 +649,6 @@ def _draft_exists_graphql(po: str, mt_record_id: str | None) -> bool:
                 edges { node { id } }
               }
             }"""
-            # Search by explicit tag key:value (quoted)
             res2 = shopify_graphql(q2, {"q": f'tag:"mt_recordID:{mt_record_id}"'})
             if (((res2.get("data", {}) or {}).get("draftOrders", {}) or {}).get("edges", [])):
                 print("  · Found existing draft by GraphQL tag query")
@@ -710,6 +771,7 @@ def to_mailing_address(order: dict, kind: str) -> dict:
 def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | None,
                                company_id: str | None, company_contact_id: str | None,
                                company_location_id: str | None) -> str:
+    # Compose note (no special assortment text added)
     note_parts = []
     if order.get("poNumber"):
         note_parts.append(f"PO: {order['poNumber']}")
@@ -718,12 +780,32 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     if order.get("shippingMethod"):
         note_parts.append(f"Shipping: {order['shippingMethod']}")
 
+    # Build line items with assortment expansion
     line_items = []
     for item in order.get("details", []) or []:
-        sku = item.get("itemNumber")
+        sku = (item.get("itemNumber") or "").strip()
         qty = int(item.get("quantity") or 0)
         parsed_price = parse_price(item.get("unitPrice"))
 
+        if is_assortment_parent(sku):
+            # Replace parent with children
+            for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
+                variant_id = find_variant_by_sku(child_sku)
+                if variant_id:
+                    # Use Shopify variant & price (do NOT set originalUnitPrice)
+                    li = {"variantId": variant_id, "quantity": int(child_qty)}
+                else:
+                    # Custom line with fallback price from table
+                    li = {
+                        "title": child_sku,   # title kept simple
+                        "sku": child_sku,
+                        "quantity": int(child_qty),
+                        "originalUnitPrice": float(fallback_price or 0.0),
+                    }
+                line_items.append(li)
+            continue  # skip adding the parent line itself
+
+        # Non-assortment normal path
         variant_id = find_variant_by_sku(sku)
         if variant_id:
             li = {"variantId": variant_id, "quantity": qty}
@@ -1000,4 +1082,3 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
