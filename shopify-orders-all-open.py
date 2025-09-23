@@ -10,38 +10,6 @@ from datetime import datetime, UTC
 from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
 
 """
-Shopify <> MarketTime sync — hardened (POST + offset/limit paging)
-
-Key changes in this version:
-- Fix duplicate empty location: reuse Shopify's auto-created blank company location
-  (assign addresses and attempt rename) instead of creating a second one.
-- Still creates a new location only when a matching one already exists with
-  a different name, or when the default stub can’t be repurposed safely.
-
-Additional change (2025-08-19):
-- Add Shopify Draft Order tags for MarketTime IDs needed by Flow write-back:
-  - mt_recordID:<id>
-  - mt_repGroupID:<id>
-  - mt_retailerID:<id>
-
-Additional change (2025-09-09):
-- Map MarketTime -> Shopify Draft metafields:
-  - b2b.ship_date  = order.shipDate (normalized to YYYY-MM-DD)
-  - b2b.bill_to_email = order.billToEmail
-
-Additional change (2025-09-13):
-- **STRONG de-dupe** before creating a draft:
-  1) Orders by po_number (GraphQL)
-  2) Draft Orders by po_number / tag (GraphQL)
-  3) Draft Orders paginated via REST (open + invoice_sent) with Link headers
-
-Additional change (2025-09-21):
-- Manual “assortment expansion” for 4 parent SKUs (LL-DISP-FA1, LL-DISP-FA2, LL-DISP-WR1, LL-DISP-WR2).
-  If a parent is found in an order, replace it with its child SKUs and multiply quantities
-  by the parent’s ordered quantity. For each child:
-    • If Shopify variant exists → add by variant (Shopify price is used)
-    • Else → add custom line with fallback price from your table.
-  No tag or note is added about the expansion.
 """
 
 # -------------------- Config & setup --------------------
@@ -73,6 +41,7 @@ PO_WHITELIST = None
 REST_PAGE_LIMIT = 250
 MAX_PAGES_PER_STATUS = 100
 REST_PAGE_SLEEP = 0.03
+REST_DEDUPE_ENABLED = True  # ← set False to skip REST draft scan
 
 # Paths
 EXPORT_DIR = "exports"
@@ -237,9 +206,7 @@ def is_assortment_parent(sku: str | None) -> bool:
     return (sku or "") in ASSORTMENT_MAP
 
 def expand_assortment_children(parent_sku: str, parent_qty: int) -> list[tuple[str, int, float]]:
-    """
-    Return list of (child_sku, expanded_qty, fallback_unit_price) based on map * parent_qty.
-    """
+    """Return list of (child_sku, expanded_qty, fallback_unit_price) based on map * parent_qty."""
     base = ASSORTMENT_MAP.get(parent_sku, [])
     q = int(parent_qty or 0)
     return [(child, per * q, fallback) for (child, per, fallback) in base]
@@ -294,6 +261,28 @@ def normalize_zone(country_code: str | None, state: str | None) -> str | None:
     if cc == "US":
         return US_STATE_ABBR.get(s.lower()) or s
     return s
+
+# Hard fixups for country fields
+def _fix_countries(order: dict):
+    """Force shipToCountry='US' and normalize billToCountry to 'US' when it's a US variant."""
+    # Ship-to: always US
+    original_ship = order.get("shipToCountry")
+    if original_ship != "US":
+        order["shipToCountry"] = "US"
+        print(f"  · Forced shipToCountry '{original_ship}' → 'US' for PO {order.get('poNumber')}")
+
+    # Bill-to: normalize 'usa' and other US variants to 'US'
+    bt = (order.get("billToCountry") or "").strip()
+    if bt:
+        bt_norm = normalize_country(bt)
+        if (bt_norm or "").upper() in {"US"}:
+            if bt != "US":
+                order["billToCountry"] = "US"
+                print(f"  · Normalized billToCountry '{bt}' → 'US' for PO {order.get('poNumber')}")
+        else:
+            # keep non-US values but normalize casing if it's 2-letter
+            if len(bt) == 2 and bt != bt.upper():
+                order["billToCountry"] = bt.upper()
 
 # -------------------- B2B helpers --------------------
 _company_id_cache: dict[str, str] = {}
@@ -617,10 +606,6 @@ def fetch_all_mt_orders() -> list[dict]:
 
 # -------------------- PO de-dupe (HARDENED) --------------------
 def _draft_exists_graphql(po: str, mt_record_id: str | None) -> bool:
-    """
-    Fast, targeted GraphQL checks for draft orders by PO number and by tag.
-    Tries both quoted and unquoted search to be robust with '#'.
-    """
     try:
         for pattern in (f'po_number:"{po}"', f"po_number:{po}"):
             q = """
@@ -658,10 +643,6 @@ def _draft_exists_graphql(po: str, mt_record_id: str | None) -> bool:
     return False
 
 def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
-    """
-    Fully paginate draft orders (open + invoice_sent) via REST using Link headers.
-    Stop if we find a matching PO or mt_recordID tag, or if we hit page cap.
-    """
     base = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
     fields = "id,po_number,tags,created_at"
     for status in ("open", "invoice_sent"):
@@ -673,6 +654,13 @@ def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
             try:
                 r = requests.get(url, headers=shopify_rest_headers, params=params, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                if code == 400:
+                    print(f"(non-blocking) REST draft scan gave 400 on page {pages}; ignoring and stopping this status.")
+                    break
+                print(f"(non-blocking) REST draft scan failed (status={status}, page={pages}): {e}")
+                break
             except Exception as e:
                 print(f"(non-blocking) REST draft scan failed (status={status}, page={pages}): {e}")
                 break
@@ -708,10 +696,6 @@ def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
     return False
 
 def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
-    """
-    True if a Shopify Order or any Draft already carries this PO (normalized),
-    or if we find a draft tagged with mt_recordID:<id>.
-    """
     target = norm_po(po)
 
     # Orders via GraphQL (fast)
@@ -737,7 +721,9 @@ def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
         return True
 
     # Drafts via REST (full pagination fallback)
-    return _rest_draft_exists(target, mt_record_id)
+    if REST_DEDUPE_ENABLED:
+        return _rest_draft_exists(target, mt_record_id)
+    return False
 
 # -------------------- Draft creation --------------------
 def to_mailing_address(order: dict, kind: str) -> dict:
@@ -751,7 +737,7 @@ def to_mailing_address(order: dict, kind: str) -> dict:
             "city": order.get("billToCity"),
             "province": order.get("billToState"),
             "zip": order.get("billToZip"),
-            "country": order.get("billToCountry") or "US",
+            "country": normalize_country(order.get("billToCountry")) or "US",
             "phone": order.get("billToPhone"),
         }
     else:
@@ -764,7 +750,7 @@ def to_mailing_address(order: dict, kind: str) -> dict:
             "city": order.get("shipToCity"),
             "province": order.get("shipToState"),
             "zip": order.get("shipToZip"),
-            "country": order.get("shipToCountry") or "US",
+            "country": normalize_country(order.get("shipToCountry")) or "US",
             "phone": order.get("shipToPhone"),
         }
 
@@ -788,22 +774,19 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         parsed_price = parse_price(item.get("unitPrice"))
 
         if is_assortment_parent(sku):
-            # Replace parent with children
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
                 variant_id = find_variant_by_sku(child_sku)
                 if variant_id:
-                    # Use Shopify variant & price (do NOT set originalUnitPrice)
                     li = {"variantId": variant_id, "quantity": int(child_qty)}
                 else:
-                    # Custom line with fallback price from table
                     li = {
-                        "title": child_sku,   # title kept simple
+                        "title": child_sku,
                         "sku": child_sku,
                         "quantity": int(child_qty),
                         "originalUnitPrice": float(fallback_price or 0.0),
                     }
                 line_items.append(li)
-            continue  # skip adding the parent line itself
+            continue  # skip the parent line itself
 
         # Non-assortment normal path
         variant_id = find_variant_by_sku(sku)
@@ -934,12 +917,6 @@ print(f"OPEN orders found: {len(open_orders)} | POs: {[o.get('poNumber') for o i
 _seen_pos: set[str] = set()
 exported_rows = []
 
-def _default_ship_country_us(order: dict):
-    val = (order.get("shipToCountry") or "").strip()
-    if not val:
-        order["shipToCountry"] = "US"
-        print(f"  · Defaulted shipToCountry -> 'US' for PO {order.get('poNumber')}")
-
 for order in open_orders:
     record_id = order.get("recordID")
     po_number = order.get("poNumber")
@@ -950,7 +927,8 @@ for order in open_orders:
     first_name = order.get("buyerFirstName")
     last_name = order.get("buyerLastName")
 
-    _default_ship_country_us(order)
+    # Country fixes
+    _fix_countries(order)
 
     if po_norm in _seen_pos:
         print(f"Skip record {record_id}: PO {po_number} already handled in this run.")
@@ -974,7 +952,7 @@ for order in open_orders:
             "city": order.get("billToCity"),
             "province": order.get("billToState"),
             "zip": order.get("billToZip"),
-            "country": order.get("billToCountry") or "US",
+            "country": normalize_country(order.get("billToCountry")) or "US",
             "phone": order.get("billToPhone"),
             "company": billToName,
             "default": True,
@@ -988,7 +966,7 @@ for order in open_orders:
             "city": order.get("shipToCity"),
             "province": order.get("shipToState"),
             "zip": order.get("shipToZip"),
-            "country": order.get("shipToCountry") or "US",
+            "country": "US",  # forced earlier; keep explicit for clarity
             "phone": order.get("shipToPhone"),
             "company": order.get("shipToName"),
         })
@@ -1082,4 +1060,3 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
