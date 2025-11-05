@@ -784,6 +784,8 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                         "sku": child_sku,
                         "quantity": int(child_qty),
                         "originalUnitPrice": float(fallback_price or 0.0),
+                        "requiresShipping": True,   # mark custom item as physical
+                        "appliesTaxes": True,       # mark custom item as taxable
                     }
                 line_items.append(li)
             continue  # skip the parent line itself
@@ -795,7 +797,14 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
             if parsed_price is not None:
                 li["originalUnitPrice"] = parsed_price
         else:
-            li = {"title": item.get("name") or sku, "sku": sku, "quantity": qty, "originalUnitPrice": parsed_price or 0}
+            li = {
+                "title": item.get("name") or sku,
+                "sku": sku,
+                "quantity": qty,
+                "originalUnitPrice": parsed_price or 0,
+                "requiresShipping": True,   # mark custom item as physical
+                "appliesTaxes": True,       # mark custom item as taxable
+            }
         line_items.append(li)
 
     # --- Build tags including MT IDs for Flow write-back
