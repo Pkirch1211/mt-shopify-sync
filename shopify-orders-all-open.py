@@ -791,8 +791,8 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                         "sku": child_sku,
                         "quantity": int(child_qty),
                         "originalUnitPrice": float(fallback_price or 0.0),
-                        "requiresShipping": True,   # mark custom item as physical
-                        "appliesTaxes": True,       # mark custom item as taxable
+                        "requiresShipping": True,  # physical product
+                        "taxable": True,           # taxable line item
                     }
                 line_items.append(li)
             continue  # skip the parent line itself
@@ -809,8 +809,8 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                 "sku": sku,
                 "quantity": qty,
                 "originalUnitPrice": parsed_price or 0,
-                "requiresShipping": True,   # mark custom item as physical
-                "appliesTaxes": True,       # mark custom item as taxable
+                "requiresShipping": True,  # physical product
+                "taxable": True,           # taxable line item
             }
         line_items.append(li)
 
@@ -873,14 +873,22 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
       }
     }"""
     out = shopify_graphql(m, {"input": input_obj})
+
+    # GraphQL-level errors (unknown fields, etc.)
+    if "errors" in out and out["errors"]:
+        raise RuntimeError("draftOrderCreate GraphQL errors: " + json.dumps(out["errors"], indent=2))
+
     payload = (out.get("data", {}) or {}).get("draftOrderCreate", {}) or {}
     errs = payload.get("userErrors", []) or []
     if errs:
-        raise RuntimeError(f"draftOrderCreate userErrors: {errs}")
+        # Validation errors from Shopify
+        raise RuntimeError("draftOrderCreate userErrors: " + json.dumps(errs, indent=2))
+
     draft = payload.get("draftOrder", {}) or {}
     draft_id = draft.get("id")
     if not draft_id:
-        raise RuntimeError("draftOrderCreate returned no draft id")
+        # Last-resort debug: full response
+        raise RuntimeError("draftOrderCreate returned no draft id; full response: " + json.dumps(out, indent=2))
     return draft_id
 
 # -------------------- Customer search helpers --------------------
@@ -1076,4 +1084,3 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
