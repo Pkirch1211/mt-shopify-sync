@@ -220,6 +220,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("11-2508-V2", 6, 10.00),
         ("LL-12-3123", 4, 6.50),
         ("LL-12-3109", 4, 6.50),
+        ("LL-12-3018", 4, 6.50),
         ("99-9504", 1, 0.00),
     ],
     "LL-DISP-WR2": [
@@ -1107,4 +1108,5 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
 
