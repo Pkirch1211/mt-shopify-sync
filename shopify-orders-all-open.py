@@ -162,6 +162,23 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
 # -------------------- Assortment expansion (manual map + fallback prices) --------------------
 # Each parent maps to list of (child_sku, qty_per_one_parent, fallback_unit_price)
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
+    "LL-00-0014": [
+        ("LL-20-3227", 6, 3.50),
+        ("LL-20-3228", 6, 3.50),
+        ("LL-20-3229", 6, 3.50),
+        ("LL-20-3230", 6, 3.50),
+        ("LL-20-3231", 6, 3.50),
+        ("LL-20-3232", 6, 3.50),
+    ],
+    "LL-00-0015": [
+        ("LL-20-3250", 6, 3.50),
+        ("LL-20-3251", 6, 3.50),
+        ("LL-20-3252", 6, 3.50),
+        ("LL-20-3253", 6, 3.50),
+        ("LL-20-3254", 6, 3.50),
+        ("LL-20-3255", 6, 3.50),
+        
+    ],    
     "LL-DISP-FA-SP26": [
         ("LL-16-3149", 8, 6.50),
         ("LL-16-3151", 4, 6.50),
@@ -185,7 +202,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-16-3244", 4, 6.50),
     ],
 
-    "LL-DISP-FA1": [
+    "LL-00-0016": [
         ("165005", 8, 6.50),
         ("165008", 8, 6.50),
         ("LL-16-3149", 8, 6.50),
@@ -194,7 +211,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-16-3153", 4, 6.50),
         ("LL-99-3087", 1, 0.00),
     ],
-    "LL-DISP-FA2": [
+    "LL-00-0018": [
         ("165005", 8, 6.50),
         ("165006", 4, 6.50),
         ("165007", 8, 6.50),
@@ -210,7 +227,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-16-3153", 8, 6.50),
         ("LL-00-0004", 1, 0.00),
     ],
-    "LL-DISP-WR1": [
+    "LL-00-0017": [
         ("11-2501", 6, 6.50),
         ("11-2502", 6, 6.50),
         ("LL-12-3066-CP12", 4, 6.50),
@@ -1108,5 +1125,6 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
 
 
