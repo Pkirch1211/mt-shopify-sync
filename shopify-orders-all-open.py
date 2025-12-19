@@ -116,7 +116,7 @@ _norm_hash_space = re.compile(r"[#\s]")
 def norm_po(po: str | None) -> str:
     return _norm_hash_space.sub("", str(po or "").strip()).upper()
 
-def parse_price(val) -> float | None:
+def parse_(val) -> float | None:
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -174,13 +174,13 @@ def _money_round(val: float) -> float:
     # Shopify money fields should be 2dp floats (still send as number)
     return float(Decimal(str(val)).quantize(Decimal("0.01")))
 
-def _price_equal(a: float | None, b: float | None, tol: float = 0.0001) -> bool:
+def __equal(a: float | None, b: float | None, tol: float = 0.0001) -> bool:
     if a is None or b is None:
         return False
     return abs(a - b) <= tol
 
-# -------------------- Assortment expansion (manual map + fallback prices) --------------------
-# Each parent maps to list of (child_sku, qty_per_one_parent, fallback_unit_price)
+# -------------------- Assortment expansion (manual map + fallback s) --------------------
+# Each parent maps to list of (child_sku, qty_per_one_parent, fallback_unit_)
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
     "LL-00-0014": [
         ("LL-20-3227", 6, 3.50),
@@ -274,14 +274,14 @@ def is_assortment_parent(sku: str | None) -> bool:
     return (sku or "") in ASSORTMENT_MAP
 
 def expand_assortment_children(parent_sku: str, parent_qty: int) -> list[tuple[str, int, float]]:
-    """Return list of (child_sku, expanded_qty, fallback_unit_price) based on map * parent_qty."""
+    """Return list of (child_sku, expanded_qty, fallback_unit_) based on map * parent_qty."""
     base = ASSORTMENT_MAP.get(parent_sku, [])
     q = int(parent_qty or 0)
     return [(child, per * q, fallback) for (child, per, fallback) in base]
 
 # -------------------- Catalog helper --------------------
 _variant_by_sku_cache: dict[str, str] = {}
-_price_by_sku_cache: dict[str, float] = {}
+__by_sku_cache: dict[str, float] = {}
 
 def find_variant_by_sku(sku: str) -> str | None:
     if not sku:
@@ -299,19 +299,19 @@ def find_variant_by_sku(sku: str) -> str | None:
     except Exception:
         return None
 
-def get_shopify_price_by_sku(sku: str) -> float | None:
+def get_shopify__by_sku(sku: str) -> float | None:
     """
-    Returns the Shopify catalog variant price for a SKU (as float).
+    Returns the Shopify catalog variant  for a SKU (as float).
     Cached per SKU. If SKU isn't found, returns None.
     """
     if not sku:
         return None
-    if sku in _price_by_sku_cache:
-        return _price_by_sku_cache[sku]
+    if sku in __by_sku_cache:
+        return __by_sku_cache[sku]
     q = """
     query($q: String!) {
       productVariants(first: 1, query: $q) {
-        nodes { id sku price }
+        nodes { id sku  }
       }
     }"""
     try:
@@ -323,9 +323,9 @@ def get_shopify_price_by_sku(sku: str) -> float | None:
         # also cache variant id opportunistically
         if n0.get("id") and sku not in _variant_by_sku_cache:
             _variant_by_sku_cache[sku] = n0["id"]
-        p = parse_price(n0.get("price"))
+        p = parse_(n0.get(""))
         if p is not None:
-            _price_by_sku_cache[sku] = p
+            __by_sku_cache[sku] = p
         return p
     except Exception:
         return None
@@ -872,10 +872,10 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     for item in order.get("details", []) or []:
         sku = (item.get("itemNumber") or "").strip()
         qty = int(item.get("quantity") or 0)
-        mt_unit = parse_price(item.get("unitPrice"))
+        mt_unit = parse_(item.get("unit"))
 
         if is_assortment_parent(sku):
-            for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
+            for child_sku, child_qty, fallback_ in expand_assortment_children(sku, qty):
                 variant_id = find_variant_by_sku(child_sku)
                 if variant_id:
                     li = {"variantId": variant_id, "quantity": int(child_qty)}
@@ -884,7 +884,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                         "title": child_sku,
                         "sku": child_sku,
                         "quantity": int(child_qty),
-                        "originalUnitPrice": float(fallback_price or 0.0),
+                        "originalUnit": float(fallback_ or 0.0),
                         "requiresShipping": True,  # physical product
                         "taxable": True,           # taxable line item
                     }
@@ -913,7 +913,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                             discount_amt = _money_round(shop_price - mt_unit)
                             li["originalUnitPrice"] = _money_round(shop_price)
                             li["appliedDiscount"] = {
-                                "description": "MarketTime unit price override",
+                                "description": "MarketTime Special Promotion",
                                 "valueType": "FIXED_AMOUNT",
                                 "value": discount_amt,   # per unit
                             }
@@ -1204,3 +1204,4 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
