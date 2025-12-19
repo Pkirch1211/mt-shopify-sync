@@ -10,6 +10,17 @@ from datetime import datetime, UTC
 from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
 
 """
+MT -> Shopify Draft Orders (B2B)
+
+NEW LOGIC (Discount normalization):
+- MarketTime may send certain SKUs with a discounted unit price (e.g., $5.00) while Shopify catalog price remains $6.50.
+- For each NON-assortment line that resolves to a Shopify variant:
+    1) Fetch Shopify variant price.
+    2) If MT unitPrice != Shopify price:
+        - If MT < Shopify: set originalUnitPrice to Shopify price and apply a per-unit FIXED_AMOUNT discount
+          so the final unit price equals MT.
+        - If MT > Shopify: treat as surcharge; set originalUnitPrice to MT (no discount).
+    3) If MT == Shopify: do not override price; let Shopify use its price.
 """
 
 # -------------------- Config & setup --------------------
@@ -159,6 +170,15 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
             pass
     return s[:10]
 
+def _money_round(val: float) -> float:
+    # Shopify money fields should be 2dp floats (still send as number)
+    return float(Decimal(str(val)).quantize(Decimal("0.01")))
+
+def _price_equal(a: float | None, b: float | None, tol: float = 0.0001) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol
+
 # -------------------- Assortment expansion (manual map + fallback prices) --------------------
 # Each parent maps to list of (child_sku, qty_per_one_parent, fallback_unit_price)
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
@@ -179,7 +199,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-20-3254", 6, 3.50),
         ("LL-20-3255", 6, 3.50),
         ("LL-99-0015", 1, 0.00),
-    ],    
+    ],
     "LL-DISP-FA-SP26": [
         ("LL-16-3149", 8, 6.50),
         ("LL-16-3151", 4, 6.50),
@@ -202,7 +222,6 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-16-3246", 4, 6.50),
         ("LL-16-3244", 4, 6.50),
     ],
-
     "LL-00-0016": [
         ("165005", 8, 6.50),
         ("165008", 8, 6.50),
@@ -262,6 +281,8 @@ def expand_assortment_children(parent_sku: str, parent_qty: int) -> list[tuple[s
 
 # -------------------- Catalog helper --------------------
 _variant_by_sku_cache: dict[str, str] = {}
+_price_by_sku_cache: dict[str, float] = {}
+
 def find_variant_by_sku(sku: str) -> str | None:
     if not sku:
         return None
@@ -275,6 +296,37 @@ def find_variant_by_sku(sku: str) -> str | None:
         if vid:
             _variant_by_sku_cache[sku] = vid
         return vid
+    except Exception:
+        return None
+
+def get_shopify_price_by_sku(sku: str) -> float | None:
+    """
+    Returns the Shopify catalog variant price for a SKU (as float).
+    Cached per SKU. If SKU isn't found, returns None.
+    """
+    if not sku:
+        return None
+    if sku in _price_by_sku_cache:
+        return _price_by_sku_cache[sku]
+    q = """
+    query($q: String!) {
+      productVariants(first: 1, query: $q) {
+        nodes { id sku price }
+      }
+    }"""
+    try:
+        data = shopify_graphql(q, {"q": f"sku:{sku}"})
+        nodes = (((data.get("data", {}) or {}).get("productVariants", {}) or {}).get("nodes", []) or [])
+        if not nodes:
+            return None
+        n0 = nodes[0] or {}
+        # also cache variant id opportunistically
+        if n0.get("id") and sku not in _variant_by_sku_cache:
+            _variant_by_sku_cache[sku] = n0["id"]
+        p = parse_price(n0.get("price"))
+        if p is not None:
+            _price_by_sku_cache[sku] = p
+        return p
     except Exception:
         return None
 
@@ -820,7 +872,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     for item in order.get("details", []) or []:
         sku = (item.get("itemNumber") or "").strip()
         qty = int(item.get("quantity") or 0)
-        parsed_price = parse_price(item.get("unitPrice"))
+        mt_unit = parse_price(item.get("unitPrice"))
 
         if is_assortment_parent(sku):
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
@@ -843,17 +895,43 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         variant_id = find_variant_by_sku(sku)
         if variant_id:
             li = {"variantId": variant_id, "quantity": qty}
-            if parsed_price is not None:
-                li["originalUnitPrice"] = parsed_price
+
+            # --- NEW: If MT price differs from Shopify price, use native discount functionality
+            if mt_unit is not None:
+                shop_price = get_shopify_price_by_sku(sku)
+
+                # If we can't determine Shopify price, preserve prior behavior (use MT as override)
+                if shop_price is None:
+                    li["originalUnitPrice"] = _money_round(mt_unit)
+                else:
+                    if _price_equal(mt_unit, shop_price):
+                        # Prices match → do NOT override price (Shopify uses its price)
+                        pass
+                    else:
+                        if mt_unit < shop_price:
+                            # Shopify price is the "list" price; discount down to MT
+                            discount_amt = _money_round(shop_price - mt_unit)
+                            li["originalUnitPrice"] = _money_round(shop_price)
+                            li["appliedDiscount"] = {
+                                "description": "MarketTime unit price override",
+                                "valueType": "FIXED_AMOUNT",
+                                "value": discount_amt,   # per unit
+                            }
+                        else:
+                            # MT > Shopify (surcharge / override) → set unit price to MT (no discount)
+                            li["originalUnitPrice"] = _money_round(mt_unit)
+
         else:
+            # Custom item (no variant). Keep MT price as the unit price.
             li = {
                 "title": item.get("name") or sku,
                 "sku": sku,
                 "quantity": qty,
-                "originalUnitPrice": parsed_price or 0,
+                "originalUnitPrice": _money_round(mt_unit or 0),
                 "requiresShipping": True,  # physical product
                 "taxable": True,           # taxable line item
             }
+
         line_items.append(li)
 
     # --- Build tags including MT IDs for Flow write-back
@@ -1126,7 +1204,3 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
-
-
-
