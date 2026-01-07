@@ -12,19 +12,15 @@ from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
 """
 MT -> Shopify Draft Orders (B2B)
 
-Price/Discount behavior:
-- Goal: Shopify reflects "list price" from Shopify, and applies a per-unit discount to reach MT price.
-- Works for BOTH:
-  A) direct MT lines (unitPrice present on the line)
-  B) assortment-expanded child lines (unitPrice usually NOT present per child) using DISCOUNT_SKUS rules
+Discount normalization:
+- If MT line price is lower than Shopify catalog price, preserve Shopify list price and apply a per-unit FIXED_AMOUNT discount.
+- Works for:
+  - direct MT lines (unitPrice present)
+  - assortment-expanded children (use DISCOUNT_SKUS -> DISCOUNT_UNIT_PRICE)
 
-Rules:
-- If we know desired unit price (from MT or discount SKU rule):
-    - If desired < Shopify price: set originalUnitPrice = Shopify price and appliedDiscount = (Shopify - desired)
-    - If desired == Shopify price: do nothing (Shopify uses its own price)
-    - If desired > Shopify price: set originalUnitPrice = desired (treat as override/surcharge)
-- If we do NOT know desired price:
-    - leave price alone for variant lines (Shopify uses its price)
+B2B linking fix:
+- Shopify CompanyLocationCreate fails if shippingAddress.phone is present but blank/invalid.
+- We now sanitize phone and OMIT it when invalid so the location can be created, which enables contact linking.
 """
 
 # -------------------- Config & setup --------------------
@@ -41,47 +37,37 @@ SHOPIFY_BASE = f"https://{SHOPIFY_STORE.strip('/')}" if not SHOPIFY_STORE.starts
 SHOPIFY_API_VERSION = "2024-10"
 HTTP_TIMEOUT = 25
 
-# MT tenant specifics
-SERVER_LIMIT = 50          # confirmed cap for your tenant
+SERVER_LIMIT = 50
 RETRY_COUNT = 3
 RETRY_SLEEP_SECS = 2
 
-# Logging
 LOG_TIMINGS = True
+PO_WHITELIST = None  # or set([...]) for testing
 
-# Optional PO whitelist; set to set([...]) or None
-PO_WHITELIST = None
-
-# Pricing debug prints (helpful when PO_WHITELIST is set)
-DEBUG_PRICING = True if PO_WHITELIST else False
-
-# Shopify draft de-dupe scan controls
 REST_PAGE_LIMIT = 250
 MAX_PAGES_PER_STATUS = 100
 REST_PAGE_SLEEP = 0.03
-REST_DEDUPE_ENABLED = True  # ← set False to skip REST draft scan
+REST_DEDUPE_ENABLED = True
 
-# Paths
 EXPORT_DIR = "exports"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Headers
 mt_headers = {"x-api-key": API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
 shopify_rest_headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json"}
 
-# -------------------- Discount configuration --------------------
-# SKUs that should be discounted to $5.00 when MT indicates discount OR when the SKU is expanded from an assortment.
+# -------------------- Discount settings --------------------
 DISCOUNT_UNIT_PRICE = 5.00
 
+# Include SKUs that should end up at $5 when they appear as assortment children or direct lines.
+# You can keep maintaining this set, or we can load from a CSV.
 DISCOUNT_SKUS: set[str] = {
-    "LL-16-3149",
-    "LL-16-3150",
-    "LL-16-3153",
-    "LL-16-3148",
-    "LL-16-3249",
-    "LL-16-3223",
-    "165005",
-    "LL-16-3202",
+    # examples - add your full promo set here
+    "165005", "165006", "165007", "165008", "165009", "165012", "165014",
+    "LL-16-3148", "LL-16-3149", "LL-16-3150", "LL-16-3151", "LL-16-3152", "LL-16-3153",
+    "LL-16-3162", "LL-16-3200", "LL-16-3201", "LL-16-3202", "LL-16-3203", "LL-16-3204",
+    "LL-16-3205", "LL-16-3206", "LL-16-3207", "LL-16-3222", "LL-16-3223", "LL-16-3224",
+    "LL-16-3225", "LL-16-3243", "LL-16-3244", "LL-16-3245", "LL-16-3246", "LL-16-3247",
+    "LL-16-3248", "LL-16-3249", "LL-16-3157", "LL-16-3158",
 }
 
 # -------------------- Utilities --------------------
@@ -132,6 +118,20 @@ _norm_hash_space = re.compile(r"[#\s]")
 def norm_po(po: str | None) -> str:
     return _norm_hash_space.sub("", str(po or "").strip()).upper()
 
+# ### FIX: normalize SKU types (int/float/string) to a canonical string
+def norm_sku(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v).strip()
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v.is_integer():
+            return str(int(v))
+        return str(v).strip()
+    return str(v).strip()
+
 def parse_price(val) -> float | None:
     if val is None:
         return None
@@ -151,7 +151,7 @@ def parse_price(val) -> float | None:
 def _money_round(val: float) -> float:
     return float(Decimal(str(val)).quantize(Decimal("0.01")))
 
-def _price_equal(a: float | None, b: float | None, tol: float = 0.0001) -> bool:
+def _nearly_equal(a: float | None, b: float | None, tol: float = 0.0001) -> bool:
     if a is None or b is None:
         return False
     return abs(a - b) <= tol
@@ -193,7 +193,29 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
             pass
     return s[:10]
 
-# -------------------- Assortment expansion (manual map + fallback prices) --------------------
+# ### FIX: sanitize phone for CompanyAddressInput (omit if invalid)
+_digits = re.compile(r"\D+")
+def normalize_phone_e164_us(phone: str | None) -> str | None:
+    """
+    Returns +1XXXXXXXXXX for valid-ish US 10-digit numbers.
+    If blank/invalid -> None (caller should omit phone).
+    """
+    if not phone:
+        return None
+    raw = str(phone).strip()
+    if not raw:
+        return None
+    # Strip extensions like "ext", "x", "#"
+    raw = re.split(r"(ext\.?|x|#)", raw, flags=re.IGNORECASE)[0].strip()
+    digits = _digits.sub("", raw)
+
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    return f"+1{digits}"
+
+# -------------------- Assortment expansion --------------------
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
     "LL-00-0014": [
         ("LL-20-3227", 6, 3.50),
@@ -291,11 +313,12 @@ def expand_assortment_children(parent_sku: str, parent_qty: int) -> list[tuple[s
     q = int(parent_qty or 0)
     return [(child, per * q, fallback) for (child, per, fallback) in base]
 
-# -------------------- Catalog helper --------------------
+# -------------------- Catalog helpers --------------------
 _variant_by_sku_cache: dict[str, str] = {}
 _price_by_sku_cache: dict[str, float] = {}
 
 def find_variant_by_sku(sku: str) -> str | None:
+    sku = norm_sku(sku)
     if not sku:
         return None
     if sku in _variant_by_sku_cache:
@@ -313,12 +336,14 @@ def find_variant_by_sku(sku: str) -> str | None:
 
 def get_shopify_price_by_sku(sku: str) -> float | None:
     """
-    Correctly fetch Shopify variant price for a SKU.
+    Return Shopify catalog variant price for SKU.
     """
+    sku = norm_sku(sku)
     if not sku:
         return None
     if sku in _price_by_sku_cache:
         return _price_by_sku_cache[sku]
+
     q = """
     query($q: String!) {
       productVariants(first: 1, query: $q) {
@@ -339,100 +364,6 @@ def get_shopify_price_by_sku(sku: str) -> float | None:
         return p
     except Exception:
         return None
-
-# -------------------- Pricing builder --------------------
-def desired_unit_price_for_sku(sku: str, mt_unit: float | None, fallback: float | None) -> float | None:
-    """
-    Determine the 'desired' unit price that we want the buyer to pay.
-    Priority:
-      1) MT unit price, if present
-      2) If SKU is in DISCOUNT_SKUS and we have a fallback/list-ish price, use DISCOUNT_UNIT_PRICE
-      3) fallback, if present (mostly for custom items / non-variant)
-      4) None
-    """
-    if mt_unit is not None:
-        return mt_unit
-
-    if sku in DISCOUNT_SKUS:
-        return DISCOUNT_UNIT_PRICE
-
-    if fallback is not None:
-        return fallback
-
-    return None
-
-def build_shopify_line_item_for_sku(
-    sku: str,
-    qty: int,
-    desired_unit: float | None,
-    title: str | None = None,
-    fallback_for_custom: float | None = None,
-    pricing_context: str = "",
-):
-    """
-    Build a Shopify DraftOrderLineItemInput with correct originalUnitPrice/appliedDiscount when needed.
-    - If variant exists: use Shopify price as list; discount down to desired if desired < shop_price.
-    - If no variant: create custom line with unit price = desired (or fallback/0).
-    """
-    variant_id = find_variant_by_sku(sku)
-
-    if variant_id:
-        li = {"variantId": variant_id, "quantity": int(qty)}
-
-        shop_price = get_shopify_price_by_sku(sku)
-
-        if desired_unit is None:
-            # Leave pricing alone; Shopify will use catalog price.
-            if DEBUG_PRICING:
-                print(f"  · [price] {pricing_context} SKU={sku} variant=yes desired=None shop={shop_price} -> (no override)")
-            return li
-
-        if shop_price is None:
-            # Can't compare; safest is to override to desired (matches your older behavior)
-            li["originalUnitPrice"] = _money_round(desired_unit)
-            if DEBUG_PRICING:
-                print(f"  · [price] {pricing_context} SKU={sku} variant=yes desired={desired_unit} shop=None -> originalUnitPrice={li['originalUnitPrice']} (no discount)")
-            return li
-
-        if _price_equal(desired_unit, shop_price):
-            if DEBUG_PRICING:
-                print(f"  · [price] {pricing_context} SKU={sku} variant=yes desired={desired_unit} shop={shop_price} -> match (no override)")
-            return li
-
-        if desired_unit < shop_price:
-            disc = _money_round(shop_price - desired_unit)
-            li["originalUnitPrice"] = _money_round(shop_price)
-            li["appliedDiscount"] = {
-                "description": "MarketTime promo price",
-                "valueType": "FIXED_AMOUNT",
-                "value": disc,  # per unit
-            }
-            if DEBUG_PRICING:
-                print(f"  · [price] {pricing_context} SKU={sku} variant=yes desired={desired_unit} shop={shop_price} -> original={li['originalUnitPrice']} discount={disc}")
-            return li
-
-        # desired > shop price: treat as override/surcharge
-        li["originalUnitPrice"] = _money_round(desired_unit)
-        if DEBUG_PRICING:
-            print(f"  · [price] {pricing_context} SKU={sku} variant=yes desired={desired_unit} shop={shop_price} -> override original={li['originalUnitPrice']}")
-        return li
-
-    # No variant -> custom item
-    unit = desired_unit
-    if unit is None:
-        unit = fallback_for_custom if fallback_for_custom is not None else 0.0
-
-    li = {
-        "title": title or sku,
-        "sku": sku,
-        "quantity": int(qty),
-        "originalUnitPrice": _money_round(unit),
-        "requiresShipping": True,
-        "taxable": True,
-    }
-    if DEBUG_PRICING:
-        print(f"  · [price] {pricing_context} SKU={sku} variant=no desired={desired_unit} -> custom unit={li['originalUnitPrice']}")
-    return li
 
 # -------------------- Country/State normalizers --------------------
 US_STATE_ABBR = {
@@ -476,15 +407,13 @@ def _fix_countries(order: dict):
     bt = (order.get("billToCountry") or "").strip()
     if bt:
         bt_norm = normalize_country(bt)
-        if (bt_norm or "").upper() in {"US"}:
-            if bt != "US":
-                order["billToCountry"] = "US"
-                print(f"  · Normalized billToCountry '{bt}' → 'US' for PO {order.get('poNumber')}")
-        else:
-            if len(bt) == 2 and bt != bt.upper():
-                order["billToCountry"] = bt.upper()
+        if (bt_norm or "").upper() == "US" and bt != "US":
+            order["billToCountry"] = "US"
+            print(f"  · Normalized billToCountry '{bt}' → 'US' for PO {order.get('poNumber')}")
+        elif len(bt) == 2 and bt != bt.upper():
+            order["billToCountry"] = bt.upper()
 
-# -------------------- B2B helpers (unchanged) --------------------
+# -------------------- B2B helpers --------------------
 _company_id_cache: dict[str, str] = {}
 _location_id_cache: dict[tuple[str, str], str] = {}
 
@@ -539,16 +468,20 @@ def to_company_address_input(order: dict, kind: str) -> dict:
             "recipient": f"{order.get('buyerFirstName') or ''} {order.get('buyerLastName') or ''}".strip() or None,
         }
     else:
-        return {
+        addr = {
             "address1": order.get("shipToAddress1"),
             "address2": order.get("shipToAddress2"),
             "city": order.get("shipToCity"),
             "zip": order.get("shipToZip"),
             "countryCode": normalize_country(order.get("shipToCountry")) or "US",
             "zoneCode": normalize_zone(normalize_country(order.get("shipToCountry")) or "US", order.get("shipToState")),
-            "phone": order.get("shipToPhone"),
             "recipient": f"{order.get('buyerFirstName') or ''} {order.get('buyerLastName') or ''}".strip() or None,
         }
+        # ### FIX: sanitize/omit phone for CompanyAddressInput
+        p = normalize_phone_e164_us(order.get("shipToPhone"))
+        if p:
+            addr["phone"] = p
+        return addr
 
 def ensure_company_location(company_id: str, name: str, order: dict) -> str | None:
     key = (company_id, name or "Default")
@@ -576,6 +509,7 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
 
     desired_name = name or "Default"
 
+    # exact name match
     for n in nodes:
         if (n.get("name") or "").strip() == desired_name.strip():
             lid = n.get("id")
@@ -594,6 +528,7 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
                 pass
             return lid
 
+    # reuse single blank generic location
     if len(nodes) == 1:
         n = nodes[0]
         lid = n.get("id")
@@ -628,6 +563,7 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
             _location_id_cache[key] = lid
             return lid
 
+    # create new location
     m = """mutation($companyId: ID!, $input: CompanyLocationInput!) {
       companyLocationCreate(companyId: $companyId, input: $input) {
         companyLocation { id name } userErrors { field message } } }"""
@@ -638,6 +574,7 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
     }
     if order.get("billToAddress1"):
         loc_input["billingAddress"] = to_company_address_input(order, "billing")
+
     data2 = shopify_graphql(m, {"companyId": company_id, "input": loc_input})
     errs = (((data2.get("data", {}) or {}).get("companyLocationCreate", {}) or {}).get("userErrors", []) or [])
     if errs:
@@ -648,6 +585,7 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
         _location_id_cache[key] = lid
     return lid
 
+# ---- contacts (match the *same* customer) ----
 def iterate_company_contacts(company_id: str):
     q = """
     query($id: ID!, $after: String) {
@@ -698,6 +636,7 @@ def get_or_create_matching_contact(company_id: str, customer_id_numeric: int | s
     print(f"(non-blocking) companyAssignCustomerAsContact errors: {errs}")
     return None
 
+# --- Contact Role helpers ---
 _role_id_cache: dict[tuple[str, str], str] = {}
 
 def get_company_role_id(company_id: str, role_name: str = "Ordering only") -> str | None:
@@ -742,7 +681,7 @@ def grant_ordering_permission(company_contact_id: str, company_location_id: str,
     })
     errs = (((out.get("data", {}) or {}).get("companyContactAssignRole", {}) or {})
             .get("userErrors", []) or [])
-    if errs and not any("already" in (e.get("message","\n").lower()) for e in errs):
+    if errs and not any("already" in (e.get("message","").lower()) for e in errs):
         print(f"(non-blocking) companyContactAssignRole errors: {errs}")
 
 # -------------------- MT fetch (POST + offset/limit) --------------------
@@ -886,6 +825,7 @@ def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
 def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
     target = norm_po(po)
 
+    # Orders
     try:
         q = """
         query($q: String!) {
@@ -903,9 +843,11 @@ def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
     except Exception:
         pass
 
+    # Drafts via GraphQL
     if _draft_exists_graphql(po, mt_record_id):
         return True
 
+    # Drafts via REST
     if REST_DEDUPE_ENABLED:
         return _rest_draft_exists(target, mt_record_id)
     return False
@@ -939,6 +881,40 @@ def to_mailing_address(order: dict, kind: str) -> dict:
             "phone": order.get("shipToPhone"),
         }
 
+def _apply_price_and_discount(li: dict, sku: str, desired_price: float | None):
+    """
+    Mutates line item dict li:
+    - If desired_price known and SKU is a Shopify variant line item:
+        compare to Shopify price and apply originalUnitPrice + appliedDiscount if needed.
+    """
+    sku = norm_sku(sku)
+    if not sku or desired_price is None:
+        return
+
+    shop_price = get_shopify_price_by_sku(sku)
+    if shop_price is None:
+        # can't compare, just set explicit price for custom item case elsewhere
+        return
+
+    desired_price = float(desired_price)
+
+    if _nearly_equal(desired_price, shop_price):
+        return
+
+    if desired_price < shop_price:
+        diff = _money_round(shop_price - desired_price)
+        li["originalUnitPrice"] = _money_round(shop_price)
+        li["appliedDiscount"] = {
+            "description": "MarketTime promo price",
+            "value": diff,
+            "valueType": "FIXED_AMOUNT",
+            "amount": diff,
+        }
+        return
+
+    # desired > shop -> override to desired (surcharge/override)
+    li["originalUnitPrice"] = _money_round(desired_price)
+
 def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | None,
                                company_id: str | None, company_contact_id: str | None,
                                company_location_id: str | None) -> str:
@@ -951,48 +927,74 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         note_parts.append(f"Shipping: {order['shippingMethod']}")
 
     line_items = []
-    for item in order.get("details", []) or []:
-        sku = (item.get("itemNumber") or "").strip()
-        qty = int(item.get("quantity") or 0)
-        mt_unit = parse_price(item.get("unitPrice"))
 
+    for item in order.get("details", []) or []:
+        sku = norm_sku(item.get("itemNumber"))
+        qty = int(item.get("quantity") or 0)
+        mt_price = parse_price(item.get("unitPrice"))
+
+        # Assortment expansion
         if is_assortment_parent(sku):
-            # IMPORTANT FIX: apply the SAME pricing rules to expanded children
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
-                desired = desired_unit_price_for_sku(child_sku, mt_unit=None, fallback=fallback_price)
-                li = build_shopify_line_item_for_sku(
-                    sku=child_sku,
-                    qty=int(child_qty),
-                    desired_unit=desired,
-                    title=child_sku,
-                    fallback_for_custom=fallback_price,
-                    pricing_context=f"(assortment:{sku})",
-                )
+                child_sku = norm_sku(child_sku)
+
+                variant_id = find_variant_by_sku(child_sku)
+                desired = None
+
+                # If child is a promo sku, we know desired = 5.00 even though MT doesn't price children
+                if child_sku in {norm_sku(x) for x in DISCOUNT_SKUS}:
+                    desired = DISCOUNT_UNIT_PRICE
+
+                if variant_id:
+                    li = {"variantId": variant_id, "quantity": int(child_qty)}
+                    # apply discount logic when desired is known
+                    _apply_price_and_discount(li, child_sku, desired)
+                else:
+                    # custom item path
+                    unit = desired if desired is not None else float(fallback_price or 0.0)
+                    li = {
+                        "title": child_sku,
+                        "sku": child_sku,
+                        "quantity": int(child_qty),
+                        "originalUnitPrice": _money_round(unit),
+                        "requiresShipping": True,
+                        "taxable": True,
+                    }
                 line_items.append(li)
             continue
 
-        # Non-assortment line
-        desired = desired_unit_price_for_sku(sku, mt_unit=mt_unit, fallback=None)
-        li = build_shopify_line_item_for_sku(
-            sku=sku,
-            qty=qty,
-            desired_unit=desired,
-            title=item.get("name") or sku,
-            fallback_for_custom=(mt_unit or 0.0),
-            pricing_context="(direct)",
-        )
+        # Normal (non-assortment) line
+        variant_id = find_variant_by_sku(sku)
+        desired = mt_price
+
+        # If MT sends blank unitPrice for promo sku, still force desired
+        if desired is None and sku in {norm_sku(x) for x in DISCOUNT_SKUS}:
+            desired = DISCOUNT_UNIT_PRICE
+
+        if variant_id:
+            li = {"variantId": variant_id, "quantity": qty}
+            _apply_price_and_discount(li, sku, desired)
+        else:
+            unit = desired if desired is not None else 0.0
+            li = {
+                "title": item.get("name") or sku,
+                "sku": sku,
+                "quantity": qty,
+                "originalUnitPrice": _money_round(unit),
+                "requiresShipping": True,
+                "taxable": True,
+            }
         line_items.append(li)
 
-    tags = [
-        "markettime",
-        f"mt_recordID:{order.get('recordID')}",
-    ]
-    if order.get("repGroupID"):
-        tags.append(f"mt_repGroupID:{order.get('repGroupID')}")
-    if order.get("retailerID"):
-        tags.append(f"mt_retailerID:{order.get('retailerID')}")
+    tags = ["markettime", f"mt_recordID:{order.get('recordID')}"]
+    rep_group_id = order.get("repGroupID")
+    if rep_group_id:
+        tags.append(f"mt_repGroupID:{rep_group_id}")
+    retailer_id = order.get("retailerID")
+    if retailer_id:
+        tags.append(f"mt_retailerID:{retailer_id}")
     if order.get("manufacturerID"):
-        tags.append(f"mt_manufacturerID:{order.get('manufacturerID')}")
+        tags.append(f"mt_manufacturerID:{order['manufacturerID']}")
 
     ship_date_val = _to_yyyy_mm_dd(order.get("shipDate"))
     bill_to_email_val = (order.get("billToEmail") or "").strip() or None
@@ -1015,7 +1017,6 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         "poNumber": order.get("poNumber"),
         "email": order.get("shipToEmail") or order.get("billToEmail") or None,
     }
-
     if metafields:
         input_obj["metafields"] = metafields
 
@@ -1053,7 +1054,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         raise RuntimeError("draftOrderCreate returned no draft id; full response: " + json.dumps(out, indent=2))
     return draft_id
 
-# -------------------- Customer search helpers (unchanged) --------------------
+# -------------------- Customer search helpers --------------------
 def _lc(s: str | None) -> str:
     return (s or "").strip().lower()
 
@@ -1099,7 +1100,6 @@ if not open_orders:
 
 print(f"OPEN orders found: {len(open_orders)} | POs: {[o.get('poNumber') for o in open_orders]}")
 
-# -------------------- Main loop --------------------
 _seen_pos: set[str] = set()
 exported_rows = []
 
@@ -1119,6 +1119,7 @@ for order in open_orders:
         print(f"Skip record {record_id}: PO {po_number} already handled in this run.")
         continue
 
+    # Customer resolution
     customer = find_customer_by_email(buyer_email) if buyer_email else None
     if not customer:
         customer = find_customer_by_name_company(first_name, last_name, billToName)
@@ -1195,6 +1196,7 @@ for order in open_orders:
         customer_id = cr.json()["customer"]["id"]
         print(f"✅ Created customer: {billToName or ''} ({first_name or ''} {last_name or ''}) ID: {customer_id}")
 
+    # Company + Location + Contact linking
     company_id = ensure_company(billToName) if billToName else None
     company_location_id = None
     company_contact_id = None
@@ -1210,22 +1212,19 @@ for order in open_orders:
                 print("→ Granting ordering permission (Ordering only)…")
                 grant_ordering_permission(company_contact_id, company_location_id, company_id)
 
-    ts_po = time.time() if LOG_TIMINGS else None
     print(f"→ Checking if PO exists in Shopify: {po_number}")
     if po_number and po_exists_in_shopify(po_number, str(record_id) if record_id else None):
-        _t("PO dedupe total", ts_po)
         print(f"Skip record {record_id}: PO {po_number} already exists in Shopify.")
         _seen_pos.add(po_norm)
         continue
 
     print("→ Creating Shopify draft order (GraphQL)…")
-    ts_create = time.time() if LOG_TIMINGS else None
     try:
         draft_id = create_draft_order_graphql(order, customer_id, company_id, company_contact_id, company_location_id)
     except Exception as e:
         print(f"✖ draftOrderCreate failed: {e}")
         continue
-    _t("draftOrderCreate", ts_create)
+
     print(f"✅ Draft order created for PO {po_number} → ID: {draft_id}")
 
     exported_rows.append({
