@@ -16,7 +16,7 @@ Discount normalization:
 - If MT line price is lower than Shopify catalog price, preserve Shopify list price and apply a per-unit FIXED_AMOUNT discount.
 - Works for:
   - direct MT lines (unitPrice present)
-  - assortment-expanded children (use DISCOUNT_SKUS -> DISCOUNT_UNIT_PRICE)
+  - assortment-expanded children (NEW: infer per-unit price from the parent assortment line)
 
 B2B linking fix:
 - Shopify CompanyLocationCreate fails if shippingAddress.phone is present but blank/invalid.
@@ -59,9 +59,8 @@ shopify_rest_headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type":
 DISCOUNT_UNIT_PRICE = 5.00
 
 # Include SKUs that should end up at $5 when they appear as assortment children or direct lines.
-# You can keep maintaining this set, or we can load from a CSV.
+# (kept as-is for DIRECT LINES; assortments now infer price from the parent)
 DISCOUNT_SKUS: set[str] = {
-    # examples - add your full promo set here
     "165005", "165006", "165007", "165008", "165009", "165012", "165014",
     "LL-16-3148", "LL-16-3149", "LL-16-3150", "LL-16-3151", "LL-16-3152", "LL-16-3153",
     "LL-16-3162", "LL-16-3200", "LL-16-3201", "LL-16-3202", "LL-16-3203", "LL-16-3204",
@@ -118,7 +117,7 @@ _norm_hash_space = re.compile(r"[#\s]")
 def norm_po(po: str | None) -> str:
     return _norm_hash_space.sub("", str(po or "").strip()).upper()
 
-# ### FIX: normalize SKU types (int/float/string) to a canonical string
+# normalize SKU types (int/float/string) to a canonical string
 def norm_sku(v) -> str:
     if v is None:
         return ""
@@ -193,7 +192,7 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
             pass
     return s[:10]
 
-# ### FIX: sanitize phone for CompanyAddressInput (omit if invalid)
+# sanitize phone for CompanyAddressInput (omit if invalid)
 _digits = re.compile(r"\D+")
 def normalize_phone_e164_us(phone: str | None) -> str | None:
     """
@@ -205,7 +204,6 @@ def normalize_phone_e164_us(phone: str | None) -> str | None:
     raw = str(phone).strip()
     if not raw:
         return None
-    # Strip extensions like "ext", "x", "#"
     raw = re.split(r"(ext\.?|x|#)", raw, flags=re.IGNORECASE)[0].strip()
     digits = _digits.sub("", raw)
 
@@ -477,7 +475,6 @@ def to_company_address_input(order: dict, kind: str) -> dict:
             "zoneCode": normalize_zone(normalize_country(order.get("shipToCountry")) or "US", order.get("shipToState")),
             "recipient": f"{order.get('buyerFirstName') or ''} {order.get('buyerLastName') or ''}".strip() or None,
         }
-        # ### FIX: sanitize/omit phone for CompanyAddressInput
         p = normalize_phone_e164_us(order.get("shipToPhone"))
         if p:
             addr["phone"] = p
@@ -509,7 +506,6 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
 
     desired_name = name or "Default"
 
-    # exact name match
     for n in nodes:
         if (n.get("name") or "").strip() == desired_name.strip():
             lid = n.get("id")
@@ -528,7 +524,6 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
                 pass
             return lid
 
-    # reuse single blank generic location
     if len(nodes) == 1:
         n = nodes[0]
         lid = n.get("id")
@@ -563,7 +558,6 @@ def ensure_company_location(company_id: str, name: str, order: dict) -> str | No
             _location_id_cache[key] = lid
             return lid
 
-    # create new location
     m = """mutation($companyId: ID!, $input: CompanyLocationInput!) {
       companyLocationCreate(companyId: $companyId, input: $input) {
         companyLocation { id name } userErrors { field message } } }"""
@@ -893,7 +887,6 @@ def _apply_price_and_discount(li: dict, sku: str, desired_price: float | None):
 
     shop_price = get_shopify_price_by_sku(sku)
     if shop_price is None:
-        # can't compare, just set explicit price for custom item case elsewhere
         return
 
     desired_price = float(desired_price)
@@ -912,8 +905,44 @@ def _apply_price_and_discount(li: dict, sku: str, desired_price: float | None):
         }
         return
 
-    # desired > shop -> override to desired (surcharge/override)
     li["originalUnitPrice"] = _money_round(desired_price)
+
+# ---- NEW: infer per-unit assortment child pricing from MT parent line ----
+def _infer_assortment_child_unit_price(parent_sku: str, parent_qty: int, parent_unit_price: float | None) -> float | None:
+    """
+    If MT parent line implies children should be $6.50 or $5.00, return that per-unit.
+    Logic:
+      total_dollars = parent_unit_price * parent_qty
+      total_units   = sum(child_units_per_parent excluding "free" inserts) * parent_qty
+      implied = total_dollars / total_units
+      if implied ~= 6.50 => 6.50
+      if implied ~= 5.00 => 5.00
+      else => None (fallback to per-child fallback_price)
+    """
+    if parent_unit_price is None:
+        return None
+    base = ASSORTMENT_MAP.get(parent_sku) or []
+    if not base:
+        return None
+
+    # exclude "free" insert lines (fallback_price == 0) from unit counts
+    units_per_parent = sum(int(per) for (_child, per, fallback_price) in base if float(fallback_price or 0.0) > 0.0)
+    if units_per_parent <= 0:
+        return None
+
+    total_units = units_per_parent * int(parent_qty or 0)
+    if total_units <= 0:
+        return None
+
+    total_dollars = float(parent_unit_price) * int(parent_qty or 0)
+    implied = total_dollars / total_units
+
+    if _nearly_equal(implied, 6.50, tol=0.02):
+        return 6.50
+    if _nearly_equal(implied, 5.00, tol=0.02):
+        return 5.00
+
+    return None
 
 def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | None,
                                company_id: str | None, company_contact_id: str | None,
@@ -933,41 +962,46 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         qty = int(item.get("quantity") or 0)
         mt_price = parse_price(item.get("unitPrice"))
 
-        # Assortment expansion
+        # Assortment expansion (UPDATED)
         if is_assortment_parent(sku):
+            inferred_child_unit = _infer_assortment_child_unit_price(
+                parent_sku=sku,
+                parent_qty=qty,
+                parent_unit_price=mt_price,
+            )
+            # If inferred_child_unit is 6.50 => force children to 6.50
+            # If inferred_child_unit is 5.00 => force children to 5.00
+            # Else => fallback per-child fallback_price (existing behavior)
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
                 child_sku = norm_sku(child_sku)
-
                 variant_id = find_variant_by_sku(child_sku)
-                desired = None
 
-                # If child is a promo sku, we know desired = 5.00 even though MT doesn't price children
-                if child_sku in {norm_sku(x) for x in DISCOUNT_SKUS}:
-                    desired = DISCOUNT_UNIT_PRICE
+                # Keep freebies at 0.00 regardless
+                if float(fallback_price or 0.0) == 0.0:
+                    desired = 0.0
+                else:
+                    desired = inferred_child_unit if inferred_child_unit is not None else float(fallback_price or 0.0)
 
                 if variant_id:
                     li = {"variantId": variant_id, "quantity": int(child_qty)}
-                    # apply discount logic when desired is known
                     _apply_price_and_discount(li, child_sku, desired)
                 else:
-                    # custom item path
-                    unit = desired if desired is not None else float(fallback_price or 0.0)
                     li = {
                         "title": child_sku,
                         "sku": child_sku,
                         "quantity": int(child_qty),
-                        "originalUnitPrice": _money_round(unit),
+                        "originalUnitPrice": _money_round(desired),
                         "requiresShipping": True,
                         "taxable": True,
                     }
                 line_items.append(li)
             continue
 
-        # Normal (non-assortment) line
+        # Normal (non-assortment) line (unchanged)
         variant_id = find_variant_by_sku(sku)
         desired = mt_price
 
-        # If MT sends blank unitPrice for promo sku, still force desired
+        # If MT sends blank unitPrice for promo sku, still force desired (direct-line behavior stays)
         if desired is None and sku in {norm_sku(x) for x in DISCOUNT_SKUS}:
             desired = DISCOUNT_UNIT_PRICE
 
