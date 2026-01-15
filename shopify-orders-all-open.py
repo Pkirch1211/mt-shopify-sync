@@ -9,19 +9,7 @@ from dotenv import load_dotenv
 from datetime import datetime, UTC
 from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
 
-"""
-MT -> Shopify Draft Orders (B2B)
 
-Discount normalization:
-- If MT line price is lower than Shopify catalog price, preserve Shopify list price and apply a per-unit FIXED_AMOUNT discount.
-- Works for:
-  - direct MT lines (unitPrice present)
-  - assortment-expanded children (NEW: infer per-unit price from the parent assortment line)
-
-B2B linking fix:
-- Shopify CompanyLocationCreate fails if shippingAddress.phone is present but blank/invalid.
-- We now sanitize phone and OMIT it when invalid so the location can be created, which enables contact linking.
-"""
 
 # -------------------- Config & setup --------------------
 load_dotenv()
@@ -212,6 +200,82 @@ def normalize_phone_e164_us(phone: str | None) -> str | None:
     if len(digits) != 10:
         return None
     return f"+1{digits}"
+
+# -------------------- Email helpers (NEW) --------------------
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def _split_email(email: str):
+    if not email:
+        return None, None
+    e = email.strip()
+    if "@" not in e:
+        return e, None
+    local, domain = e.rsplit("@", 1)
+    return local, (domain.lower().strip() if domain else None)
+
+def _is_basic_email(email: str) -> bool:
+    # Basic sanity check only (no DNS lookups)
+    if not email:
+        return False
+    return bool(_EMAIL_RE.match(email.strip()))
+
+def _levenshtein(a: str, b: str) -> int:
+    # Small, fast Levenshtein for short strings (domains)
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (ca != cb)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+def reconcile_emails(bill_email: str | None, ship_email: str | None) -> str | None:
+    """
+    If both are present and domains differ by a tiny typo (edit distance <= 2),
+    rewrite ship_email to use bill_email domain. Also:
+      - if ship_email malformed but bill_email valid => use bill_email
+      - otherwise leave ship_email unchanged
+    """
+    ship_email = (ship_email or "").strip() or None
+    bill_email = (bill_email or "").strip() or None
+
+    if not ship_email:
+        return ship_email
+    if not bill_email:
+        return ship_email
+
+    bill_ok = _is_basic_email(bill_email)
+    ship_ok = _is_basic_email(ship_email)
+
+    if ship_ok and not bill_ok:
+        return ship_email
+    if bill_ok and not ship_ok:
+        return bill_email
+
+    bill_local, bill_domain = _split_email(bill_email)
+    ship_local, ship_domain = _split_email(ship_email)
+
+    if not bill_domain or not ship_domain:
+        return ship_email
+    if bill_domain == ship_domain:
+        return ship_email
+
+    if _levenshtein(bill_domain, ship_domain) <= 2:
+        if ship_local:
+            return f"{ship_local}@{bill_domain}"
+        return bill_email
+
+    return ship_email
 
 # -------------------- Assortment expansion --------------------
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
@@ -1042,6 +1106,9 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     if po_num_val:
         metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
+    # -------------------- Email selection (UPDATED) --------------------
+    ship_to_email_fixed = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail"))
+
     input_obj = {
         "lineItems": line_items,
         "note": " | ".join([p for p in note_parts if p]),
@@ -1049,7 +1116,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         "billingAddress": to_mailing_address(order, "billing"),
         "shippingAddress": to_mailing_address(order, "shipping"),
         "poNumber": order.get("poNumber"),
-        "email": order.get("shipToEmail") or order.get("billToEmail") or None,
+        "email": ship_to_email_fixed or order.get("billToEmail") or None,
     }
     if metafields:
         input_obj["metafields"] = metafields
@@ -1143,7 +1210,10 @@ for order in open_orders:
     po_norm = norm_po(po_number)
     billToName = order.get("billToName")
     shipToName = order.get("shipToName") or billToName or "Default"
-    buyer_email = order.get("shipToEmail") or order.get("billToEmail") or None
+
+    # -------------------- Email selection (UPDATED) --------------------
+    buyer_email = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail")) or order.get("billToEmail") or None
+
     first_name = order.get("buyerFirstName")
     last_name = order.get("buyerLastName")
 
@@ -1194,8 +1264,11 @@ for order in open_orders:
             addresses.append(ship_addr)
 
         customer_body = {"first_name": first_name, "last_name": last_name, "tags": "markettime", "company": billToName}
+
+        # NOTE: buyer_email is already reconciled/sanitized; keep regex gate as-is
         if buyer_email and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", buyer_email):
             customer_body["email"] = buyer_email
+
         if addresses:
             customer_body["addresses"] = addresses
 
