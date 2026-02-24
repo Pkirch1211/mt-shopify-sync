@@ -365,6 +365,31 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-12-3124", 4, 6.50),
         ("99-9504", 1, 0.00),
     ],
+    "LL-TWR-FA160": [
+        ("165005", 8, 5.00),
+        ("165006", 4, 5.00),
+        ("165007", 4, 5.00),
+        ("165008", 12, 5.00),
+        ("165012", 4, 5.00),
+        ("165014", 8, 5.00),
+        ("LL-16-3148", 12, 5.00),
+        ("LL-16-3153", 12, 5.00),
+        ("LL-16-3149", 12, 5.00),
+        ("LL-16-3151", 4, 5.00),
+        ("LL-16-3200", 4, 5.00),
+        ("LL-16-3205", 8, 5.00),
+        ("LL-16-3207", 4, 5.00),
+        ("LL-16-3249", 4, 5.00),
+        ("LL-16-3222", 8, 5.00),
+        ("LL-16-3223", 4, 5.00),
+        ("LL-16-3202", 4, 5.00),
+        ("LL-16-3203", 8, 5.00),
+        ("LL-16-3225", 12, 5.00),
+        ("LL-16-3243", 12, 5.00),
+        ("LL-16-3154", 8, 5.00),
+        ("LL-16-3206", 4, 5.00),
+        ("LL-00-0004", 2, 0.00),
+    ],
 }
 
 def is_assortment_parent(sku: str | None) -> bool:
@@ -1350,4 +1375,5 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
+
 
