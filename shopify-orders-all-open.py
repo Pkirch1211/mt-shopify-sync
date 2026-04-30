@@ -1,13 +1,16 @@
 import os
 import json
 import csv
+import zipfile
 import time
 import re
 import requests
+import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from datetime import datetime, UTC
 from urllib.parse import urlparse, parse_qs  # for REST pagination of drafts
+from pathlib import Path
 
 
 
@@ -278,258 +281,164 @@ def reconcile_emails(bill_email: str | None, ship_email: str | None) -> str | No
     return ship_email
 
 # -------------------- Assortment expansion --------------------
-ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
-   "00-LL-00-0014": [
-        ("LL-20-3227", 6, 3.50),
-        ("LL-20-3228", 6, 3.50),
-        ("LL-20-3229", 6, 3.50),
-        ("LL-20-3230", 6, 3.50),
-        ("LL-20-3231", 6, 3.50),
-        ("LL-20-3232", 6, 3.50),
-        ("99-9502", 2, 0.00),
-    ],
-   "LL-Mini-RO": [
-        ("LL-20-3227", 6, 3.50),
-        ("LL-20-3228", 6, 3.50),
-        ("LL-20-3229", 6, 3.50),
-        ("LL-20-3230", 6, 3.50),
-        ("LL-20-3231", 6, 3.50),
-        ("LL-20-3232", 6, 3.50),
-    ],
-    "00-LL-00-0015": [
-        ("LL-20-3250", 12, 3.50),
-        ("LL-20-3251", 12, 3.50),
-        ("LL-20-3255", 12, 3.50),
-        ("LL-99-0015", 1, 0.00),
-    ],
-    "00-LL-DISP-FA-SP26": [
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("LL-16-3223", 4, 6.50),
-        ("LL-16-3150", 4, 6.50),
-        ("LL-16-3203", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-16-3243", 4, 6.50),
-        ("LL-16-3206", 4, 6.50),
-    ],
-    "00-LL-DISP-FA-FA26": [
-        ("LL-16-3248", 4, 6.50),
-        ("LL-16-3157", 8, 6.50),
-        ("LL-16-3247", 4, 6.50),
-        ("LL-16-3158", 8, 6.50),
-    ],
-    "00-LL-DISP-FA-WN26": [
-        ("LL-16-3245", 8, 6.50),
-        ("LL-16-3162", 8, 6.50),
-        ("LL-16-3246", 4, 6.50),
-        ("LL-16-3244", 4, 6.50),
-    ],
-    "00-LL-00-0016": [
-        ("165005", 4, 6.50),
-        ("165008", 4, 6.50),
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 4, 6.50),
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3200", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-99-3087", 1, 0.00),
-    ],
-    "00-LL-00-0018": [
-        ("165005", 8, 6.50),
-        ("165008", 8, 6.50),
-        ("165012", 8, 6.50),
-        ("165014", 4, 6.50),
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 8, 6.50),
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3150", 8, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("LL-16-3222", 8, 6.50),
-        ("LL-16-3205", 4, 6.50),
-        ("LL-16-3200", 4, 6.50),
-        ("LL-00-0004", 1, 0.00),
-    ],
-    "00-LL-00-0017": [
-        ("11-2501", 6, 6.50),
-        ("11-2502", 6, 6.50),
-        ("LL-12-3066-CP12", 4, 6.50),
-        ("LL-12-3102", 4, 10.00),
-        ("11-2507", 4, 6.50),
-        ("LL-12-3121", 4, 6.50),
-        ("LL-11-2508-CP12", 4, 10.00),
-        ("LL-12-3123", 4, 6.50),
-        ("LL-12-3109", 4, 6.50),
-        ("LL-12-3018", 4, 6.50),
-        ("99-9504", 1, 0.00),
-    ],
-    "00-LL-DISP-WR2": [
-        ("11-2501", 6, 6.50),
-        ("11-2504", 6, 6.50),
-        ("LL-12-3121", 4, 6.50),
-        ("LL-12-3123", 8, 6.50),
-        ("LL-12-3124", 8, 6.50),
-        ("99-9504", 1, 0.00),
-    ],
-    "00-LL-TWR-FA160": [
-        ("165005", 8, 5.00),
-        ("165006", 4, 5.00),
-        ("165007", 4, 5.00),
-        ("165008", 12, 5.00),
-        ("165012", 12, 5.00),
-        ("LL-16-3148", 12, 5.00),
-        ("LL-16-3153", 12, 5.00),
-        ("LL-16-3149", 12, 5.00),
-        ("LL-16-3150", 8, 5.00),
-        ("LL-16-3151", 8, 5.00),
-        ("LL-16-3225", 12, 5.00),
-        ("LL-16-3243", 12, 5.00),
-        ("LL-16-3154", 8, 5.00),
-        ("LL-16-3203", 8, 5.00),
-        ("LL-16-3205", 8, 5.00),
-        ("LL-16-3222", 8, 5.00),
-        ("LL-16-3202", 4, 5.00),
-        ("LL-16-3200", 4, 5.00),
-        ("LL-16-3223", 4, 5.00),
-        ("LL-16-3249", 4, 5.00),
-        ("LL-16-3207", 12, 5.00),
-        ("LL-16-3206", 4, 5.00),
-        ("LL-00-0004", 1, 0.00),
-    ],
-    "00-LL-RO-FA48": [
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 8, 6.50),
-        ("LL-16-3149", 4, 6.50),
-        ("165005", 4, 6.50),
-        ("165008", 4, 6.50),
-        ("LL-16-3150", 4, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("165012", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-16-3205", 4, 6.50),
-    ],
+ASSORTMENT_XLSX_PATH = os.getenv("ASSORTMENT_XLSX_PATH", "assortment-expansion.xlsx")
 
-    "LL-00-0014": [
-        ("LL-20-3227", 6, 3.50),
-        ("LL-20-3228", 6, 3.50),
-        ("LL-20-3229", 6, 3.50),
-        ("LL-20-3230", 6, 3.50),
-        ("LL-20-3231", 6, 3.50),
-        ("LL-20-3232", 6, 3.50),
-        ("99-9502", 2, 0.00),
-    ],
-    "LL-00-0015": [
-        ("LL-20-3250", 12, 3.50),
-        ("LL-20-3251", 12, 3.50),
-        ("LL-20-3255", 12, 3.50),
-        ("LL-99-0015", 1, 0.00),
-    ],
-    "LL-DISP-FA-SP26": [
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("LL-16-3223", 4, 6.50),
-        ("LL-16-3150", 4, 6.50),
-        ("LL-16-3203", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-16-3243", 4, 6.50),
-        ("LL-16-3206", 4, 6.50),
-    ],
-    "LL-DISP-FA-FA26": [
-        ("LL-16-3248", 4, 6.50),
-        ("LL-16-3157", 8, 6.50),
-        ("LL-16-3247", 4, 6.50),
-        ("LL-16-3158", 8, 6.50),
-    ],
-    "LL-DISP-FA-WN26": [
-        ("LL-16-3245", 8, 6.50),
-        ("LL-16-3162", 8, 6.50),
-        ("LL-16-3246", 4, 6.50),
-        ("LL-16-3244", 4, 6.50),
-    ],
-    "LL-00-0016": [
-        ("165005", 4, 6.50),
-        ("165008", 4, 6.50),
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 4, 6.50),
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3200", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-99-3087", 1, 0.00),
-    ],
-    "LL-00-0018": [
-        ("165005", 8, 6.50),
-        ("165008", 8, 6.50),
-        ("165012", 8, 6.50),
-        ("165014", 4, 6.50),
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 8, 6.50),
-        ("LL-16-3149", 8, 6.50),
-        ("LL-16-3150", 8, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("LL-16-3222", 8, 6.50),
-        ("LL-16-3205", 4, 6.50),
-        ("LL-16-3200", 4, 6.50),
-        ("LL-00-0004", 1, 0.00),
-    ],
-    "LL-00-0017": [
-        ("11-2501", 6, 6.50),
-        ("11-2502", 6, 6.50),
-        ("LL-12-3066-CP12", 4, 6.50),
-        ("LL-12-3102", 4, 10.00),
-        ("11-2507", 4, 6.50),
-        ("LL-12-3121", 4, 6.50),
-        ("LL-11-2508-CP12", 4, 10.00),
-        ("LL-12-3123", 4, 6.50),
-        ("LL-12-3109", 4, 6.50),
-        ("LL-12-3018", 4, 6.50),
-        ("99-9504", 1, 0.00),
-    ],
-    "LL-DISP-WR2": [
-        ("11-2501", 6, 6.50),
-        ("11-2504", 6, 6.50),
-        ("LL-12-3121", 4, 6.50),
-        ("LL-12-3123", 8, 6.50),
-        ("LL-12-3124", 8, 6.50),
-        ("99-9504", 1, 0.00),
-    ],
-    "LL-TWR-FA160": [
-        ("165005", 8, 5.00),
-        ("165006", 4, 5.00),
-        ("165007", 4, 5.00),
-        ("165008", 12, 5.00),
-        ("165012", 12, 5.00),
-        ("LL-16-3148", 12, 5.00),
-        ("LL-16-3153", 12, 5.00),
-        ("LL-16-3149", 12, 5.00),
-        ("LL-16-3150", 8, 5.00),
-        ("LL-16-3151", 8, 5.00),
-        ("LL-16-3225", 12, 5.00),
-        ("LL-16-3243", 12, 5.00),
-        ("LL-16-3154", 8, 5.00),
-        ("LL-16-3203", 8, 5.00),
-        ("LL-16-3205", 8, 5.00),
-        ("LL-16-3222", 8, 5.00),
-        ("LL-16-3202", 4, 5.00),
-        ("LL-16-3200", 4, 5.00),
-        ("LL-16-3223", 4, 5.00),
-        ("LL-16-3249", 4, 5.00),
-        ("LL-16-3207", 12, 5.00),
-        ("LL-16-3206", 4, 5.00),
-        ("LL-00-0004", 1, 0.00),
-    ],
-    "LL-RO-FA48": [
-        ("LL-16-3148", 8, 6.50),
-        ("LL-16-3153", 8, 6.50),
-        ("LL-16-3149", 4, 6.50),
-        ("165005", 4, 6.50),
-        ("165008", 4, 6.50),
-        ("LL-16-3150", 4, 6.50),
-        ("LL-16-3151", 4, 6.50),
-        ("165012", 4, 6.50),
-        ("LL-16-3222", 4, 6.50),
-        ("LL-16-3205", 4, 6.50),
-    ],
+_XLSX_NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+_XLSX_REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
 
-}
+def _resolve_assortment_xlsx_path(path_value: str) -> str:
+    path = Path(path_value)
+    if path.is_absolute():
+        return str(path)
+    here = Path(__file__).resolve().parent
+    return str(here / path)
+
+def _xlsx_col_to_index(cell_ref: str) -> int:
+    letters = re.sub(r"[^A-Z]", "", str(cell_ref or "").upper())
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+def _xlsx_cell_value(cell, shared_strings: list[str]):
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        text_node = cell.find("main:is/main:t", _XLSX_NS)
+        return text_node.text if text_node is not None else ""
+
+    value_node = cell.find("main:v", _XLSX_NS)
+    if value_node is None:
+        return ""
+    raw = value_node.text or ""
+
+    if cell_type == "s":
+        try:
+            return shared_strings[int(raw)]
+        except Exception:
+            return raw
+
+    return raw
+
+def _load_first_sheet_rows(xlsx_path: str) -> list[list[str]]:
+    with zipfile.ZipFile(xlsx_path) as zf:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            shared_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in shared_root.findall("main:si", _XLSX_NS):
+                parts = [t.text or "" for t in si.findall(".//main:t", _XLSX_NS)]
+                shared_strings.append("".join(parts))
+
+        workbook_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        first_sheet = workbook_root.find("main:sheets/main:sheet", _XLSX_NS)
+        if first_sheet is None:
+            return []
+
+        rel_id = first_sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        rel_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+
+        target = None
+        for rel in rel_root.findall("rel:Relationship", _XLSX_REL_NS):
+            if rel.attrib.get("Id") == rel_id:
+                target = rel.attrib.get("Target")
+                break
+
+        if not target:
+            return []
+
+        target = target.lstrip("/")
+        if not target.startswith("xl/"):
+            target = f"xl/{target}"
+
+        sheet_root = ET.fromstring(zf.read(target))
+        rows: list[list[str]] = []
+        for row in sheet_root.findall(".//main:sheetData/main:row", _XLSX_NS):
+            values: list[str] = []
+            for cell in row.findall("main:c", _XLSX_NS):
+                idx = _xlsx_col_to_index(cell.attrib.get("r", "A1"))
+                while len(values) <= idx:
+                    values.append("")
+                values[idx] = _xlsx_cell_value(cell, shared_strings)
+            rows.append(values)
+        return rows
+
+def _header_key(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+def load_assortment_map_from_xlsx(path_value: str = ASSORTMENT_XLSX_PATH) -> dict[str, list[tuple[str, int, float]]]:
+    xlsx_path = _resolve_assortment_xlsx_path(path_value)
+    if not os.path.exists(xlsx_path):
+        raise FileNotFoundError(
+            f"Assortment expansion file not found: {xlsx_path}. "
+            "Add assortment-expansion.xlsx to the repo root or set ASSORTMENT_XLSX_PATH."
+        )
+
+    required = {"parent_sku", "child_sku", "child_qty_per_parent", "fallback_unit_price"}
+    aliases = {
+        "parent": "parent_sku",
+        "parent_item_number": "parent_sku",
+        "assortment_sku": "parent_sku",
+        "sku": "parent_sku",
+        "child": "child_sku",
+        "child_item_number": "child_sku",
+        "child_qty": "child_qty_per_parent",
+        "quantity": "child_qty_per_parent",
+        "qty": "child_qty_per_parent",
+        "per_parent_qty": "child_qty_per_parent",
+        "fallback_price": "fallback_unit_price",
+        "unit_price": "fallback_unit_price",
+        "price": "fallback_unit_price",
+    }
+
+    rows = _load_first_sheet_rows(xlsx_path)
+    header_idx = None
+    col_map: dict[str, int] = {}
+
+    for i, row in enumerate(rows):
+        normalized = [aliases.get(_header_key(v), _header_key(v)) for v in row]
+        candidate = {name: idx for idx, name in enumerate(normalized) if name}
+        if required.issubset(candidate.keys()):
+            header_idx = i
+            col_map = candidate
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Could not find required assortment columns in Excel: "
+            "parent_sku, child_sku, child_qty_per_parent, fallback_unit_price"
+        )
+
+    mapping: dict[str, list[tuple[str, int, float]]] = {}
+    for row in rows[header_idx + 1:]:
+        def get_col(name: str):
+            idx = col_map[name]
+            return row[idx] if idx < len(row) else ""
+
+        parent_sku = norm_sku(get_col("parent_sku"))
+        child_sku = norm_sku(get_col("child_sku"))
+        if not parent_sku or not child_sku:
+            continue
+
+        qty_raw = get_col("child_qty_per_parent")
+        try:
+            child_qty = int(float(str(qty_raw).strip()))
+        except Exception:
+            raise ValueError(f"Invalid child_qty_per_parent for {parent_sku} -> {child_sku}: {qty_raw!r}")
+
+        fallback_price = parse_price(get_col("fallback_unit_price"))
+        if fallback_price is None:
+            raise ValueError(f"Invalid fallback_unit_price for {parent_sku} -> {child_sku}")
+
+        mapping.setdefault(parent_sku, []).append((child_sku, child_qty, _money_round(fallback_price)))
+
+    if not mapping:
+        raise ValueError("No assortment expansion rows were loaded from Excel.")
+
+    total_children = sum(len(children) for children in mapping.values())
+    print(f"Loaded {len(mapping)} assortment parent SKUs / {total_children} child rows from {xlsx_path}")
+    return mapping
+
+ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = load_assortment_map_from_xlsx()
+
 
 def is_assortment_parent(sku: str | None) -> bool:
     return (sku or "") in ASSORTMENT_MAP
@@ -989,532 +898,4 @@ def _draft_exists_graphql(po: str, mt_record_id: str | None) -> bool:
                 return True
     except Exception:
         pass
-    return False
-
-def _rest_draft_exists(target_po_norm: str, mt_record_id: str | None) -> bool:
-    base = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
-    fields = "id,po_number,tags,created_at"
-    for status in ("open", "invoice_sent"):
-        params = {"status": status, "limit": REST_PAGE_LIMIT, "fields": fields}
-        url = base
-        pages = 0
-        while True:
-            pages += 1
-            try:
-                r = requests.get(url, headers=shopify_rest_headers, params=params, timeout=HTTP_TIMEOUT)
-                r.raise_for_status()
-            except requests.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
-                if code == 400:
-                    print(f"(non-blocking) REST draft scan gave 400 on page {pages}; ignoring and stopping this status.")
-                    break
-                print(f"(non-blocking) REST draft scan failed (status={status}, page={pages}): {e}")
-                break
-            except Exception as e:
-                print(f"(non-blocking) REST draft scan failed (status={status}, page={pages}): {e}")
-                break
-
-            for d in (r.json().get("draft_orders") or []):
-                po_shop = norm_po(d.get("po_number"))
-                if po_shop and po_shop == target_po_norm:
-                    print(f"  · Found existing draft via REST (status={status}, page={pages})")
-                    return True
-                if mt_record_id and f"mt_recordID:{mt_record_id}" in (d.get("tags") or ""):
-                    print(f"  · Found existing draft by REST tag (status={status}, page={pages})")
-                    return True
-
-            link = r.headers.get("Link") or ""
-            if 'rel="next"' not in link:
-                break
-
-            try:
-                next_part = [p for p in link.split(",") if 'rel="next"' in p][0]
-                next_url = next_part[next_part.find("<")+1 : next_part.find(">")]
-                pu = urlparse(next_url)
-                url = f"{pu.scheme}://{pu.netloc}{pu.path}"
-                q = parse_qs(pu.query)
-                params = {"status": status, "limit": REST_PAGE_LIMIT, "fields": fields, "page_info": q.get("page_info", [""])[0]}
-            except Exception:
-                break
-
-            if pages >= MAX_PAGES_PER_STATUS:
-                print(f"(non-blocking) REST draft scan reached page cap ({MAX_PAGES_PER_STATUS}) for status={status}")
-                break
-
-            time.sleep(REST_PAGE_SLEEP)
-    return False
-
-def po_exists_in_shopify(po: str, mt_record_id: str | None = None) -> bool:
-    target = norm_po(po)
-
-    # Orders
-    try:
-        q = """
-        query($q: String!) {
-          orders(first: 1, query: $q) {
-            edges { node { id poNumber } }
-          }
-        }"""
-        res = shopify_graphql(q, {"q": f"po_number:{po} -status:cancelled"})
-        edges = (((res.get("data", {}) or {}).get("orders", {}) or {}).get("edges", []) or [])
-        for e in edges:
-            n = e.get("node", {}) or {}
-            if norm_po(n.get("poNumber")) == target:
-                print("  · Found existing Shopify ORDER by PO")
-                return True
-    except Exception:
-        pass
-
-    # Drafts via GraphQL
-    if _draft_exists_graphql(po, mt_record_id):
-        return True
-
-    # Drafts via REST
-    if REST_DEDUPE_ENABLED:
-        return _rest_draft_exists(target, mt_record_id)
-    return False
-
-# -------------------- Draft creation --------------------
-def to_mailing_address(order: dict, kind: str) -> dict:
-    if kind == "billing":
-        return {
-            "firstName": order.get("buyerFirstName"),
-            "lastName": order.get("buyerLastName"),
-            "company": order.get("billToName"),
-            "address1": order.get("billToAddress1"),
-            "address2": order.get("billToAddress2"),
-            "city": order.get("billToCity"),
-            "province": order.get("billToState"),
-            "zip": order.get("billToZip"),
-            "country": normalize_country(order.get("billToCountry")) or "US",
-            "phone": order.get("billToPhone"),
-        }
-    else:
-        return {
-            "firstName": order.get("buyerFirstName"),
-            "lastName": order.get("buyerLastName"),
-            "company": order.get("shipToName"),
-            "address1": order.get("shipToAddress1"),
-            "address2": order.get("shipToAddress2"),
-            "city": order.get("shipToCity"),
-            "province": order.get("shipToState"),
-            "zip": order.get("shipToZip"),
-            "country": normalize_country(order.get("shipToCountry")) or "US",
-            "phone": order.get("shipToPhone"),
-        }
-
-def _apply_price_and_discount(li: dict, sku: str, desired_price: float | None):
-    """
-    Mutates line item dict li:
-    - If desired_price known and SKU is a Shopify variant line item:
-        compare to Shopify price and apply originalUnitPrice + appliedDiscount if needed.
-    """
-    sku = norm_sku(sku)
-    if not sku or desired_price is None:
-        return
-
-    shop_price = get_shopify_price_by_sku(sku)
-    if shop_price is None:
-        return
-
-    desired_price = float(desired_price)
-
-    if _nearly_equal(desired_price, shop_price):
-        return
-
-    if desired_price < shop_price:
-        diff = _money_round(shop_price - desired_price)
-        li["originalUnitPrice"] = _money_round(shop_price)
-        li["appliedDiscount"] = {
-            "description": "MarketTime promo price",
-            "value": diff,
-            "valueType": "FIXED_AMOUNT",
-            "amount": diff,
-        }
-        return
-
-    li["originalUnitPrice"] = _money_round(desired_price)
-
-# ---- NEW: infer per-unit assortment child pricing from MT parent line ----
-def _infer_assortment_child_unit_price(parent_sku: str, parent_qty: int, parent_unit_price: float | None) -> float | None:
-    """
-    If MT parent line implies children should be $6.50 or $5.00, return that per-unit.
-    Logic:
-      total_dollars = parent_unit_price * parent_qty
-      total_units   = sum(child_units_per_parent excluding "free" inserts) * parent_qty
-      implied = total_dollars / total_units
-      if implied ~= 6.50 => 6.50
-      if implied ~= 5.00 => 5.00
-      else => None (fallback to per-child fallback_price)
-    """
-    if parent_unit_price is None:
-        return None
-    base = ASSORTMENT_MAP.get(parent_sku) or []
-    if not base:
-        return None
-
-    # exclude "free" insert lines (fallback_price == 0) from unit counts
-    units_per_parent = sum(int(per) for (_child, per, fallback_price) in base if float(fallback_price or 0.0) > 0.0)
-    if units_per_parent <= 0:
-        return None
-
-    total_units = units_per_parent * int(parent_qty or 0)
-    if total_units <= 0:
-        return None
-
-    total_dollars = float(parent_unit_price) * int(parent_qty or 0)
-    implied = total_dollars / total_units
-
-    if _nearly_equal(implied, 6.50, tol=0.02):
-        return 6.50
-    if _nearly_equal(implied, 5.00, tol=0.02):
-        return 5.00
-
-    return None
-
-def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | None,
-                               company_id: str | None, company_contact_id: str | None,
-                               company_location_id: str | None) -> str:
-    note_parts = []
-    if order.get("poNumber"):
-        note_parts.append(f"PO: {order['poNumber']}")
-    if order.get("specialInstructions"):
-        note_parts.append(order["specialInstructions"])
-    if order.get("shippingMethod"):
-        note_parts.append(f"Shipping: {order['shippingMethod']}")
-
-    line_items = []
-
-    for item in order.get("details", []) or []:
-        sku = norm_sku(item.get("itemNumber"))
-        qty = int(item.get("quantity") or 0)
-        mt_price = parse_price(item.get("unitPrice"))
-
-        # Assortment expansion (UPDATED)
-        if is_assortment_parent(sku):
-            inferred_child_unit = _infer_assortment_child_unit_price(
-                parent_sku=sku,
-                parent_qty=qty,
-                parent_unit_price=mt_price,
-            )
-            # If inferred_child_unit is 6.50 => force children to 6.50
-            # If inferred_child_unit is 5.00 => force children to 5.00
-            # Else => fallback per-child fallback_price (existing behavior)
-            for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
-                child_sku = norm_sku(child_sku)
-                variant_id = find_variant_by_sku(child_sku)
-
-                # Keep freebies at 0.00 regardless
-                if float(fallback_price or 0.0) == 0.0:
-                    desired = 0.0
-                else:
-                    desired = inferred_child_unit if inferred_child_unit is not None else float(fallback_price or 0.0)
-
-                if variant_id:
-                    li = {"variantId": variant_id, "quantity": int(child_qty)}
-                    _apply_price_and_discount(li, child_sku, desired)
-                else:
-                    li = {
-                        "title": child_sku,
-                        "sku": child_sku,
-                        "quantity": int(child_qty),
-                        "originalUnitPrice": _money_round(desired),
-                        "requiresShipping": True,
-                        "taxable": True,
-                    }
-                line_items.append(li)
-            continue
-
-        # Normal (non-assortment) line (unchanged)
-        variant_id = find_variant_by_sku(sku)
-        desired = mt_price
-
-        # If MT sends blank unitPrice for promo sku, still force desired (direct-line behavior stays)
-        if desired is None and sku in {norm_sku(x) for x in DISCOUNT_SKUS}:
-            desired = DISCOUNT_UNIT_PRICE
-
-        if variant_id:
-            li = {"variantId": variant_id, "quantity": qty}
-            _apply_price_and_discount(li, sku, desired)
-        else:
-            unit = desired if desired is not None else 0.0
-            li = {
-                "title": item.get("name") or sku,
-                "sku": sku,
-                "quantity": qty,
-                "originalUnitPrice": _money_round(unit),
-                "requiresShipping": True,
-                "taxable": True,
-            }
-        line_items.append(li)
-
-    tags = ["markettime", f"mt_recordID:{order.get('recordID')}"]
-    rep_group_id = order.get("repGroupID")
-    if rep_group_id:
-        tags.append(f"mt_repGroupID:{rep_group_id}")
-    retailer_id = order.get("retailerID")
-    if retailer_id:
-        tags.append(f"mt_retailerID:{retailer_id}")
-    if order.get("manufacturerID"):
-        tags.append(f"mt_manufacturerID:{order['manufacturerID']}")
-
-    ship_date_val = _to_yyyy_mm_dd(order.get("shipDate"))
-    bill_to_email_val = (order.get("billToEmail") or "").strip() or None
-    po_num_val = (order.get("poNumber") or "").strip() or None
-
-    metafields = []
-    if ship_date_val:
-        metafields.append({"namespace": "b2b", "key": "ship_date", "value": ship_date_val})
-    if bill_to_email_val:
-        metafields.append({"namespace": "b2b", "key": "bill_to_email", "value": bill_to_email_val})
-    if po_num_val:
-        metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
-
-    # -------------------- Email selection (UPDATED) --------------------
-    ship_to_email_fixed = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail"))
-
-    input_obj = {
-        "lineItems": line_items,
-        "note": " | ".join([p for p in note_parts if p]),
-        "tags": tags,
-        "billingAddress": to_mailing_address(order, "billing"),
-        "shippingAddress": to_mailing_address(order, "shipping"),
-        "poNumber": order.get("poNumber"),
-        "email": ship_to_email_fixed or order.get("billToEmail") or None,
-    }
-    if metafields:
-        input_obj["metafields"] = metafields
-
-    if company_id and company_contact_id and company_location_id:
-        input_obj["purchasingEntity"] = {
-            "purchasingCompany": {
-                "companyId": company_id,
-                "companyContactId": company_contact_id,
-                "companyLocationId": company_location_id,
-            }
-        }
-    elif customer_id_numeric:
-        input_obj["purchasingEntity"] = {"customerId": to_gid("Customer", customer_id_numeric)}
-
-    m = """
-    mutation($input: DraftOrderInput!) {
-      draftOrderCreate(input: $input) {
-        draftOrder { id name poNumber purchasingEntity { __typename } }
-        userErrors { field message }
-      }
-    }"""
-    out = shopify_graphql(m, {"input": input_obj})
-
-    if "errors" in out and out["errors"]:
-        raise RuntimeError("draftOrderCreate GraphQL errors: " + json.dumps(out["errors"], indent=2))
-
-    payload = (out.get("data", {}) or {}).get("draftOrderCreate", {}) or {}
-    errs = payload.get("userErrors", []) or []
-    if errs:
-        raise RuntimeError("draftOrderCreate userErrors: " + json.dumps(errs, indent=2))
-
-    draft = payload.get("draftOrder", {}) or {}
-    draft_id = draft.get("id")
-    if not draft_id:
-        raise RuntimeError("draftOrderCreate returned no draft id; full response: " + json.dumps(out, indent=2))
-    return draft_id
-
-# -------------------- Customer search helpers --------------------
-def _lc(s: str | None) -> str:
-    return (s or "").strip().lower()
-
-def find_customer_by_email(email: str) -> dict | None:
-    url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
-    r = requests.get(url, headers=shopify_rest_headers, params={"query": f"email:{email}"}, timeout=HTTP_TIMEOUT)
-    if r.ok:
-        for c in r.json().get("customers", []):
-            if _lc(c.get("email")) == _lc(email):
-                return c
-    return None
-
-def find_customer_by_name_company(first: str | None, last: str | None, company: str | None) -> dict | None:
-    terms = []
-    if first:
-        terms.append(f"first_name:{first}")
-    if last:
-        terms.append(f"last_name:{last}")
-    if company:
-        terms.append(f"company:'{company}'")
-    if not terms:
-        return None
-    q = " ".join(terms)
-    url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
-    r = requests.get(url, headers=shopify_rest_headers, params={"query": q}, timeout=HTTP_TIMEOUT)
-    if r.ok:
-        for c in r.json().get("customers", []):
-            if _lc(c.get("first_name")) == _lc(first) and _lc(c.get("last_name")) == _lc(last) and _lc(c.get("company")) == _lc(company):
-                return c
-    return None
-
-# -------------------- Fetch MarketTime orders + process --------------------
-orders_all = fetch_all_mt_orders()
-open_orders = [o for o in orders_all if str(o.get("manufacturerOrderStatus", "")).upper() == "OPEN"]
-
-if PO_WHITELIST:
-    open_orders = [o for o in open_orders if str(o.get("poNumber")) in PO_WHITELIST]
-    print(f"PO whitelist active: {sorted(PO_WHITELIST)} -> {len(open_orders)} open orders in scope")
-
-if not open_orders:
-    print("No matching OPEN orders found.")
-    raise SystemExit(0)
-
-print(f"OPEN orders found: {len(open_orders)} | POs: {[o.get('poNumber') for o in open_orders]}")
-
-_seen_pos: set[str] = set()
-exported_rows = []
-
-for order in open_orders:
-    record_id = order.get("recordID")
-    po_number = order.get("poNumber")
-    po_norm = norm_po(po_number)
-    billToName = order.get("billToName")
-    shipToName = order.get("shipToName") or billToName or "Default"
-
-    # -------------------- Email selection (UPDATED) --------------------
-    buyer_email = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail")) or order.get("billToEmail") or None
-
-    first_name = order.get("buyerFirstName")
-    last_name = order.get("buyerLastName")
-
-    _fix_countries(order)
-
-    if po_norm in _seen_pos:
-        print(f"Skip record {record_id}: PO {po_number} already handled in this run.")
-        continue
-
-    # Customer resolution
-    customer = find_customer_by_email(buyer_email) if buyer_email else None
-    if not customer:
-        customer = find_customer_by_name_company(first_name, last_name, billToName)
-
-    if customer:
-        customer_id = customer["id"]
-        print(f"↺ Reusing customer {customer.get('first_name','')} {customer.get('last_name','')} (ID: {customer_id})")
-    else:
-        def _clean_addr(d: dict) -> dict:
-            return {k: v for k, v in d.items() if v not in (None, "", [])}
-
-        addresses = []
-        bill_addr = _clean_addr({
-            "address1": order.get("billToAddress1"),
-            "address2": order.get("billToAddress2"),
-            "city": order.get("billToCity"),
-            "province": order.get("billToState"),
-            "zip": order.get("billToZip"),
-            "country": normalize_country(order.get("billToCountry")) or "US",
-            "phone": order.get("billToPhone"),
-            "company": billToName,
-            "default": True,
-        })
-        if bill_addr.get("address1"):
-            addresses.append(bill_addr)
-
-        ship_addr = _clean_addr({
-            "address1": order.get("shipToAddress1"),
-            "address2": order.get("shipToAddress2"),
-            "city": order.get("shipToCity"),
-            "province": order.get("shipToState"),
-            "zip": order.get("shipToZip"),
-            "country": "US",
-            "phone": order.get("shipToPhone"),
-            "company": order.get("shipToName"),
-        })
-        if ship_addr.get("address1"):
-            addresses.append(ship_addr)
-
-        customer_body = {"first_name": first_name, "last_name": last_name, "tags": "markettime", "company": billToName}
-
-        # NOTE: buyer_email is already reconciled/sanitized; keep regex gate as-is
-        if buyer_email and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", buyer_email):
-            customer_body["email"] = buyer_email
-
-        if addresses:
-            customer_body["addresses"] = addresses
-
-        create_url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers.json"
-        cr = requests.post(create_url, headers=shopify_rest_headers, json={"customer": customer_body}, timeout=HTTP_TIMEOUT)
-
-        if cr.status_code == 422:
-            try:
-                err_json = cr.json()
-            except Exception:
-                err_json = {"raw": cr.text}
-            print(f"✖ Customer create 422 for PO {po_number}: {err_json}")
-            reason = json.dumps(err_json).lower()
-            retry_body = dict(customer_body)
-            changed = False
-            if "email" in reason and "email" in retry_body:
-                retry_body.pop("email", None); changed = True
-            if "phone" in reason and "phone" in retry_body:
-                retry_body.pop("phone", None); changed = True
-            if changed:
-                cr = requests.post(create_url, headers=shopify_rest_headers, json={"customer": retry_body}, timeout=HTTP_TIMEOUT)
-
-        if cr.status_code == 422:
-            try:
-                err_json = cr.json()
-            except Exception:
-                err_json = {"raw": cr.text}
-            print(f"Skip record {record_id} (PO {po_number}): cannot create customer — {err_json}")
-            continue
-
-        cr.raise_for_status()
-        customer_id = cr.json()["customer"]["id"]
-        print(f"✅ Created customer: {billToName or ''} ({first_name or ''} {last_name or ''}) ID: {customer_id}")
-
-    # Company + Location + Contact linking
-    company_id = ensure_company(billToName) if billToName else None
-    company_location_id = None
-    company_contact_id = None
-    if company_id:
-        print("→ Ensuring company location…")
-        company_location_id = ensure_company_location(company_id, shipToName, order)
-
-        if customer_id and company_location_id:
-            print("→ Resolving matching company contact…")
-            company_contact_id = get_or_create_matching_contact(company_id, customer_id)
-
-            if company_contact_id:
-                print("→ Granting ordering permission (Ordering only)…")
-                grant_ordering_permission(company_contact_id, company_location_id, company_id)
-
-    print(f"→ Checking if PO exists in Shopify: {po_number}")
-    if po_number and po_exists_in_shopify(po_number, str(record_id) if record_id else None):
-        print(f"Skip record {record_id}: PO {po_number} already exists in Shopify.")
-        _seen_pos.add(po_norm)
-        continue
-
-    print("→ Creating Shopify draft order (GraphQL)…")
-    try:
-        draft_id = create_draft_order_graphql(order, customer_id, company_id, company_contact_id, company_location_id)
-    except Exception as e:
-        print(f"✖ draftOrderCreate failed: {e}")
-        continue
-
-    print(f"✅ Draft order created for PO {po_number} → ID: {draft_id}")
-
-    exported_rows.append({
-        "mt_recordID": record_id,
-        "shopify_draft_order_id": draft_id,
-        "poNumber": po_number,
-        "company": billToName,
-        "buyer_email": buyer_email or "unknown@example.com",
-        "line_item_count": len(order.get("details", []) or []),
-        "created_at": datetime.now(UTC).isoformat(),
-    })
-
-    _seen_pos.add(po_norm)
-    time.sleep(0.15)
-
-csv_path = export_rows_to_csv(exported_rows)
-print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
-print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
-
-
-
+    ret
