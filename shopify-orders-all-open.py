@@ -204,23 +204,80 @@ def normalize_phone_e164_us(phone: str | None) -> str | None:
         return None
     return f"+1{digits}"
 
-# -------------------- Email helpers (NEW) --------------------
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# -------------------- Email helpers (HARDENED) --------------------
+# Shopify may reject syntactically odd domains in DraftOrderInput.email.
+# These helpers normalize common MarketTime paste/export artifacts and omit
+# the draft email entirely when no safe candidate exists.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+def _clean_email_candidate(value) -> str | None:
+    """Return one normalized email candidate, or None.
+
+    Handles values like:
+      - "Name <person@example.com>"
+      - "mailto:person@example.com"
+      - comma/semicolon/whitespace-separated accidental multi-values
+      - hidden CR/LF/control characters from exports
+    """
+    if value is None:
+        return None
+
+    s = str(value).strip().strip('"').strip("'")
+    if not s:
+        return None
+
+    s = s.replace("mailto:", "")
+    m = re.search(r"<([^<>]+@[^<>]+)>", s)
+    if m:
+        s = m.group(1)
+
+    # Normalize controls/separators before choosing a token.
+    s = _CONTROL_CHARS_RE.sub(" ", s)
+    s = s.replace(",", " ").replace(";", " ")
+
+    tokens = [t.strip().strip('"').strip("'") for t in s.split() if "@" in t]
+    if not tokens and "@" in s:
+        tokens = [s.strip()]
+    if not tokens:
+        return None
+
+    e = tokens[0].rstrip(".,;:")
+    if "@" not in e:
+        return None
+    local, domain = e.rsplit("@", 1)
+    local = local.strip()
+    domain = domain.strip().lower()
+    return f"{local}@{domain}" if local and domain else None
 
 def _split_email(email: str):
-    if not email:
-        return None, None
-    e = email.strip()
-    if "@" not in e:
+    e = _clean_email_candidate(email)
+    if not e or "@" not in e:
         return e, None
     local, domain = e.rsplit("@", 1)
-    return local, (domain.lower().strip() if domain else None)
+    return local, domain
 
-def _is_basic_email(email: str) -> bool:
-    # Basic sanity check only (no DNS lookups)
-    if not email:
-        return False
-    return bool(_EMAIL_RE.match(email.strip()))
+def email_invalid_reason(email: str | None) -> str | None:
+    e = _clean_email_candidate(email)
+    if not e:
+        return "blank or no email token"
+    if not _EMAIL_RE.match(e):
+        return "invalid email/domain syntax"
+    local, domain = e.rsplit("@", 1)
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return "domain missing dot"
+    for label in labels:
+        if not label:
+            return "domain has empty label"
+        if label.startswith("-") or label.endswith("-"):
+            return "domain label starts/ends with hyphen"
+    if not re.match(r"^[A-Za-z]{2,63}$", labels[-1]):
+        return "top-level domain is invalid"
+    return None
+
+def _is_valid_email(email: str | None) -> bool:
+    return email_invalid_reason(email) is None
 
 def _levenshtein(a: str, b: str) -> int:
     # Small, fast Levenshtein for short strings (domains)
@@ -243,42 +300,54 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 def reconcile_emails(bill_email: str | None, ship_email: str | None) -> str | None:
-    """
-    If both are present and domains differ by a tiny typo (edit distance <= 2),
-    rewrite ship_email to use bill_email domain. Also:
-      - if ship_email malformed but bill_email valid => use bill_email
-      - otherwise leave ship_email unchanged
-    """
-    ship_email = (ship_email or "").strip() or None
-    bill_email = (bill_email or "").strip() or None
+    """Return a safe email for Shopify, preferring ship/contact email.
 
-    if not ship_email:
-        return ship_email
-    if not bill_email:
-        return ship_email
+    If the ship email is invalid but bill email is valid, use bill email.
+    If both are valid and their domains look like a tiny typo, preserve the
+    ship local-part but rewrite to the bill domain. If both are valid but
+    unrelated, keep the ship email. If neither is valid, return None.
+    """
+    ship_email = _clean_email_candidate(ship_email)
+    bill_email = _clean_email_candidate(bill_email)
 
-    bill_ok = _is_basic_email(bill_email)
-    ship_ok = _is_basic_email(ship_email)
+    ship_ok = _is_valid_email(ship_email)
+    bill_ok = _is_valid_email(bill_email)
 
     if ship_ok and not bill_ok:
         return ship_email
     if bill_ok and not ship_ok:
         return bill_email
+    if not ship_ok and not bill_ok:
+        return None
 
     bill_local, bill_domain = _split_email(bill_email)
     ship_local, ship_domain = _split_email(ship_email)
 
-    if not bill_domain or not ship_domain:
-        return ship_email
-    if bill_domain == ship_domain:
+    if not bill_domain or not ship_domain or bill_domain == ship_domain:
         return ship_email
 
     if _levenshtein(bill_domain, ship_domain) <= 2:
-        if ship_local:
-            return f"{ship_local}@{bill_domain}"
-        return bill_email
+        return f"{ship_local}@{bill_domain}" if ship_local else bill_email
 
     return ship_email
+
+def choose_order_email(order: dict) -> tuple[str | None, str, list[dict]]:
+    """Select the email to send to Shopify and return debug metadata."""
+    raw_candidates = [
+        ("shipToEmail", order.get("shipToEmail")),
+        ("billToEmail", order.get("billToEmail")),
+    ]
+    debug = []
+    for source, raw in raw_candidates:
+        cleaned = _clean_email_candidate(raw)
+        reason = email_invalid_reason(cleaned)
+        debug.append({"source": source, "raw": raw, "cleaned": cleaned, "valid": reason is None, "reason": reason})
+
+    selected = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail"))
+    if selected:
+        selected_source = "shipToEmail" if selected == (debug[0].get("cleaned")) else "billToEmail/reconciled"
+        return selected, selected_source, debug
+    return None, "omitted_no_valid_email", debug
 
 # -------------------- Assortment expansion --------------------
 ASSORTMENT_XLSX_PATH = os.getenv("ASSORTMENT_XLSX_PATH", "assortment-expansion.xlsx")
@@ -1179,8 +1248,8 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     if po_num_val:
         metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
-    # -------------------- Email selection (UPDATED) --------------------
-    ship_to_email_fixed = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail"))
+    # -------------------- Email selection (HARDENED) --------------------
+    draft_email, draft_email_source, draft_email_debug = choose_order_email(order)
 
     input_obj = {
         "lineItems": line_items,
@@ -1189,8 +1258,11 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         "billingAddress": to_mailing_address(order, "billing"),
         "shippingAddress": to_mailing_address(order, "shipping"),
         "poNumber": order.get("poNumber"),
-        "email": ship_to_email_fixed or order.get("billToEmail") or None,
     }
+    if draft_email:
+        input_obj["email"] = draft_email
+    else:
+        print(f"⚠ Omitting DraftOrderInput.email for PO {order.get('poNumber')}: {draft_email_debug}")
     if metafields:
         input_obj["metafields"] = metafields
 
@@ -1220,7 +1292,13 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     payload = (out.get("data", {}) or {}).get("draftOrderCreate", {}) or {}
     errs = payload.get("userErrors", []) or []
     if errs:
-        raise RuntimeError("draftOrderCreate userErrors: " + json.dumps(errs, indent=2))
+        raise RuntimeError(
+            "draftOrderCreate userErrors for "
+            f"PO {order.get('poNumber')} / record {order.get('recordID')} / "
+            f"draft_email={draft_email!r} source={draft_email_source} / "
+            f"email_debug={json.dumps(draft_email_debug)}: "
+            + json.dumps(errs, indent=2)
+        )
 
     draft = payload.get("draftOrder", {}) or {}
     draft_id = draft.get("id")
@@ -1284,8 +1362,10 @@ for order in open_orders:
     billToName = order.get("billToName")
     shipToName = order.get("shipToName") or billToName or "Default"
 
-    # -------------------- Email selection (UPDATED) --------------------
-    buyer_email = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail")) or order.get("billToEmail") or None
+    # -------------------- Email selection (HARDENED) --------------------
+    buyer_email, buyer_email_source, buyer_email_debug = choose_order_email(order)
+    if not buyer_email:
+        print(f"⚠ No valid buyer email for PO {po_number}; customer lookup/create will proceed without email. Debug: {buyer_email_debug}")
 
     first_name = order.get("buyerFirstName")
     last_name = order.get("buyerLastName")
@@ -1338,8 +1418,8 @@ for order in open_orders:
 
         customer_body = {"first_name": first_name, "last_name": last_name, "tags": "markettime", "company": billToName}
 
-        # NOTE: buyer_email is already reconciled/sanitized; keep regex gate as-is
-        if buyer_email and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", buyer_email):
+        # buyer_email is already cleaned; only attach it if Shopify-safe.
+        if buyer_email and _is_valid_email(buyer_email):
             customer_body["email"] = buyer_email
 
         if addresses:
@@ -1398,11 +1478,13 @@ for order in open_orders:
         _seen_pos.add(po_norm)
         continue
 
-    print("→ Creating Shopify draft order (GraphQL)…")
+    print(f"→ Creating Shopify draft order (GraphQL) for PO {po_number} / record {record_id} / email={buyer_email!r} source={buyer_email_source}")
     try:
         draft_id = create_draft_order_graphql(order, customer_id, company_id, company_contact_id, company_location_id)
     except Exception as e:
-        print(f"✖ draftOrderCreate failed: {e}")
+        print(f"✖ draftOrderCreate failed for PO {po_number} / record {record_id} / company={billToName!r} / customer={first_name!r} {last_name!r}")
+        print(f"  email_debug={buyer_email_debug}")
+        print(f"  error={e}")
         continue
 
     print(f"✅ Draft order created for PO {po_number} → ID: {draft_id}")
@@ -1423,6 +1505,5 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
 
 
