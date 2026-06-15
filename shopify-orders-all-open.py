@@ -183,6 +183,40 @@ def _to_yyyy_mm_dd(val: str | None) -> str | None:
             pass
     return s[:10]
 
+# -------------------- Payment terms helpers --------------------
+# MarketTime tenants/exports can label the payment terms field differently.
+# Keep this broad but explicit, and use the first non-empty value found.
+PAYMENT_TERMS_FIELD_CANDIDATES = (
+    "paymentTerms",
+    "paymentTerm",
+    "payment_terms",
+    "payment_term",
+    "terms",
+    "term",
+    "orderTerms",
+    "order_terms",
+    "paymentTermsName",
+    "paymentTermName",
+    "termsName",
+    "termsCode",
+    "paymentTermsCode",
+    "paymentTermCode",
+    "paymentTermsDescription",
+    "paymentTermDescription",
+    "termsDescription",
+)
+
+def get_payment_terms(order: dict) -> str | None:
+    """Return the first non-empty MarketTime payment terms value on the order."""
+    for key in PAYMENT_TERMS_FIELD_CANDIDATES:
+        val = order.get(key)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
 # sanitize phone for CompanyAddressInput (omit if invalid)
 _digits = re.compile(r"\D+")
 def normalize_phone_e164_us(phone: str | None) -> str | None:
@@ -1158,6 +1192,11 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         note_parts.append(f"PO: {order['poNumber']}")
     if order.get("specialInstructions"):
         note_parts.append(order["specialInstructions"])
+
+    payment_terms = get_payment_terms(order)
+    if payment_terms:
+        note_parts.append(f"Payment Terms: {payment_terms}")
+
     if order.get("shippingMethod"):
         note_parts.append(f"Shipping: {order['shippingMethod']}")
 
@@ -1505,5 +1544,4 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
 
