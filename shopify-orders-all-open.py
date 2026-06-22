@@ -385,6 +385,7 @@ def choose_order_email(order: dict) -> tuple[str | None, str, list[dict]]:
 
 # -------------------- Assortment expansion --------------------
 ASSORTMENT_XLSX_PATH = os.getenv("ASSORTMENT_XLSX_PATH", "assortment-expansion.xlsx")
+EOL_SKU_XLSX_PATH = os.getenv("EOL_SKU_XLSX_PATH", "eol_sku_list.xlsx")
 
 _XLSX_NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _XLSX_REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
@@ -540,7 +541,62 @@ def load_assortment_map_from_xlsx(path_value: str = ASSORTMENT_XLSX_PATH) -> dic
     print(f"Loaded {len(mapping)} assortment parent SKUs / {total_children} child rows from {xlsx_path}")
     return mapping
 
+def load_eol_skus_from_xlsx(path_value: str = EOL_SKU_XLSX_PATH) -> set[str]:
+    """Load SKUs that should be removed from draft-order line items.
+
+    Expected Excel format: first sheet with a header named sku, eol_sku, item_number, or item.
+    If no recognized header is found, column A is treated as the SKU list.
+    """
+    xlsx_path = _resolve_assortment_xlsx_path(path_value)
+    if not os.path.exists(xlsx_path):
+        raise FileNotFoundError(
+            f"EOL SKU file not found: {xlsx_path}. "
+            "Add eol_sku_list.xlsx to the repo root or set EOL_SKU_XLSX_PATH."
+        )
+
+    rows = _load_first_sheet_rows(xlsx_path)
+    if not rows:
+        raise ValueError(f"EOL SKU file is empty: {xlsx_path}")
+
+    aliases = {
+        "sku",
+        "eol_sku",
+        "end_of_life_sku",
+        "item_number",
+        "item",
+        "itemnumber",
+    }
+
+    header_idx = None
+    sku_col = 0
+    for i, row in enumerate(rows[:10]):
+        normalized = [_header_key(v) for v in row]
+        for idx, key in enumerate(normalized):
+            if key in aliases:
+                header_idx = i
+                sku_col = idx
+                break
+        if header_idx is not None:
+            break
+
+    data_start = header_idx + 1 if header_idx is not None else 0
+    eol_skus: set[str] = set()
+    for row in rows[data_start:]:
+        raw = row[sku_col] if sku_col < len(row) else ""
+        sku = norm_sku(raw)
+        if sku:
+            eol_skus.add(sku)
+
+    print(f"Loaded {len(eol_skus)} EOL SKUs from {xlsx_path}")
+    return eol_skus
+
+
 ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = load_assortment_map_from_xlsx()
+EOL_SKUS: set[str] = load_eol_skus_from_xlsx()
+
+
+def is_eol_sku(sku: str | None) -> bool:
+    return norm_sku(sku) in EOL_SKUS
 
 
 def is_assortment_parent(sku: str | None) -> bool:
@@ -1201,11 +1257,18 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         note_parts.append(f"Shipping: {order['shippingMethod']}")
 
     line_items = []
+    removed_eol_skus: list[tuple[str, int, str]] = []
 
     for item in order.get("details", []) or []:
         sku = norm_sku(item.get("itemNumber"))
         qty = int(item.get("quantity") or 0)
         mt_price = parse_price(item.get("unitPrice"))
+
+        # Remove direct EOL SKUs before sending to Shopify.
+        if is_eol_sku(sku):
+            removed_eol_skus.append((sku, qty, "direct"))
+            print(f"  · Removed EOL SKU {sku} x {qty} from PO {order.get('poNumber')}")
+            continue
 
         # Assortment expansion (UPDATED)
         if is_assortment_parent(sku):
@@ -1219,6 +1282,13 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
             # Else => fallback per-child fallback_price (existing behavior)
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
                 child_sku = norm_sku(child_sku)
+
+                # Remove EOL SKUs that appear as assortment children.
+                if is_eol_sku(child_sku):
+                    removed_eol_skus.append((child_sku, int(child_qty), f"assortment:{sku}"))
+                    print(f"  · Removed EOL child SKU {child_sku} x {int(child_qty)} from PO {order.get('poNumber')} (parent {sku})")
+                    continue
+
                 variant_id = find_variant_by_sku(child_sku)
 
                 # Keep freebies at 0.00 regardless
@@ -1264,6 +1334,15 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                 "taxable": True,
             }
         line_items.append(li)
+
+    if removed_eol_skus:
+        removed_summary = ", ".join(f"{sku} x{qty} ({source})" for sku, qty, source in removed_eol_skus)
+        note_parts.append(f"Removed EOL SKUs: {removed_summary}")
+
+    if not line_items:
+        raise RuntimeError(
+            f"No line items left for PO {order.get('poNumber')} after EOL SKU removal; skipping draft creation."
+        )
 
     tags = ["markettime", f"mt_recordID:{order.get('recordID')}"]
     rep_group_id = order.get("repGroupID")
@@ -1544,4 +1623,3 @@ for order in open_orders:
 csv_path = export_rows_to_csv(exported_rows)
 print(f"Processed OPEN orders: {len(open_orders)} | Created draft orders: {len(exported_rows)}")
 print(f"CSV exported: {csv_path}" if csv_path else "No new orders were exported; CSV not created.")
-
