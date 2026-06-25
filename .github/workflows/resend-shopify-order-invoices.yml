@@ -1,0 +1,90 @@
+name: Resend Shopify Order Invoices
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "dry_run"
+        type: choice
+        options:
+          - dry_run
+          - live
+      order_name:
+        description: "Optional: send just one order first, e.g. #24720"
+        required: false
+        default: ""
+      include_paid:
+        description: "Also resend invoices for orders marked paid/refunded/voided"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      subject_prefix:
+        description: "Email subject prefix"
+        required: true
+        default: "Invoice"
+      message:
+        description: "Custom invoice message"
+        required: true
+        default: "Hello — we are resending this invoice because the original invoice may have been sent to an outdated contact email. Please use this updated invoice link for payment. Thank you!"
+
+jobs:
+  resend-order-invoices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv
+
+      - name: Build arguments
+        id: args
+        shell: bash
+        run: |
+          ARGS="--orders-file order_invoice_resend_list.txt"
+
+          if [ -n "${{ github.event.inputs.order_name }}" ]; then
+            ARGS="$ARGS --order-name '${{ github.event.inputs.order_name }}'"
+          fi
+
+          if [ "${{ github.event.inputs.mode }}" = "live" ]; then
+            ARGS="$ARGS --live"
+          fi
+
+          if [ "${{ github.event.inputs.include_paid }}" = "true" ]; then
+            ARGS="$ARGS --include-paid"
+          fi
+
+          ARGS="$ARGS --subject-prefix '${{ github.event.inputs.subject_prefix }}'"
+          ARGS="$ARGS --message '${{ github.event.inputs.message }}'"
+
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Resend invoices
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_API_VERSION: "2024-10"
+          DRY_RUN: ${{ github.event.inputs.mode == 'dry_run' && 'true' || 'false' }}
+        run: |
+          eval python resend_shopify_order_invoices.py ${{ steps.args.outputs.args }}
+
+      - name: Upload audit CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: resend-order-invoices-audit
+          path: resend_order_invoices_audit_*.csv
+          if-no-files-found: error
