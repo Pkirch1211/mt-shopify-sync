@@ -334,42 +334,33 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 def reconcile_emails(bill_email: str | None, ship_email: str | None) -> str | None:
-    """Return a safe email for Shopify, preferring ship/contact email.
+    """Return a safe email for Shopify invoices, preferring billToEmail.
 
-    If the ship email is invalid but bill email is valid, use bill email.
-    If both are valid and their domains look like a tiny typo, preserve the
-    ship local-part but rewrite to the bill domain. If both are valid but
-    unrelated, keep the ship email. If neither is valid, return None.
+    Use shipToEmail only as a fallback when billToEmail is blank or invalid.
+    This prevents invoices from being sent to shipping contacts when a billing
+    email exists.
     """
-    ship_email = _clean_email_candidate(ship_email)
     bill_email = _clean_email_candidate(bill_email)
+    ship_email = _clean_email_candidate(ship_email)
 
-    ship_ok = _is_valid_email(ship_email)
     bill_ok = _is_valid_email(bill_email)
+    ship_ok = _is_valid_email(ship_email)
 
-    if ship_ok and not bill_ok:
-        return ship_email
-    if bill_ok and not ship_ok:
+    if bill_ok:
         return bill_email
-    if not ship_ok and not bill_ok:
-        return None
-
-    bill_local, bill_domain = _split_email(bill_email)
-    ship_local, ship_domain = _split_email(ship_email)
-
-    if not bill_domain or not ship_domain or bill_domain == ship_domain:
+    if ship_ok:
         return ship_email
-
-    if _levenshtein(bill_domain, ship_domain) <= 2:
-        return f"{ship_local}@{bill_domain}" if ship_local else bill_email
-
-    return ship_email
+    return None
 
 def choose_order_email(order: dict) -> tuple[str | None, str, list[dict]]:
-    """Select the email to send to Shopify and return debug metadata."""
+    """Select the Shopify invoice email and return debug metadata.
+
+    Priority is intentionally billToEmail first. shipToEmail is only a fallback
+    when billToEmail is blank or invalid.
+    """
     raw_candidates = [
-        ("shipToEmail", order.get("shipToEmail")),
         ("billToEmail", order.get("billToEmail")),
+        ("shipToEmail", order.get("shipToEmail")),
     ]
     debug = []
     for source, raw in raw_candidates:
@@ -379,9 +370,27 @@ def choose_order_email(order: dict) -> tuple[str | None, str, list[dict]]:
 
     selected = reconcile_emails(order.get("billToEmail"), order.get("shipToEmail"))
     if selected:
-        selected_source = "shipToEmail" if selected == (debug[0].get("cleaned")) else "billToEmail/reconciled"
-        return selected, selected_source, debug
+        if selected == debug[0].get("cleaned"):
+            return selected, "billToEmail", debug
+        if selected == debug[1].get("cleaned"):
+            return selected, "shipToEmail_fallback", debug
+        return selected, "reconciled", debug
     return None, "omitted_no_valid_email", debug
+
+def assert_invoice_email_choice(order: dict, selected_email: str | None, selected_source: str, debug: list[dict]):
+    """Fail fast if a valid billToEmail exists but was not selected.
+
+    This is a production guardrail for invoice recipient safety. It allows
+    shipToEmail only when billToEmail is missing or invalid.
+    """
+    bill_email = _clean_email_candidate(order.get("billToEmail"))
+    if _is_valid_email(bill_email) and selected_source != "billToEmail":
+        raise RuntimeError(
+            "Refusing to create draft with non-bill-to invoice email. "
+            f"PO={order.get('poNumber')} selected={selected_email!r} "
+            f"source={selected_source} billToEmail={order.get('billToEmail')!r} "
+            f"shipToEmail={order.get('shipToEmail')!r} debug={json.dumps(debug)}"
+        )
 
 # -------------------- Assortment expansion --------------------
 ASSORTMENT_XLSX_PATH = os.getenv("ASSORTMENT_XLSX_PATH", "assortment-expansion.xlsx")
@@ -1366,8 +1375,13 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
     if po_num_val:
         metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
-    # -------------------- Email selection (HARDENED) --------------------
+    # -------------------- Email selection (BILL-TO-FIRST) --------------------
     draft_email, draft_email_source, draft_email_debug = choose_order_email(order)
+    assert_invoice_email_choice(order, draft_email, draft_email_source, draft_email_debug)
+    print(
+        f"  · Shopify invoice email selected: {draft_email!r} source={draft_email_source} "
+        f"billToEmail={order.get('billToEmail')!r} shipToEmail={order.get('shipToEmail')!r}"
+    )
 
     input_obj = {
         "lineItems": line_items,
@@ -1480,8 +1494,14 @@ for order in open_orders:
     billToName = order.get("billToName")
     shipToName = order.get("shipToName") or billToName or "Default"
 
-    # -------------------- Email selection (HARDENED) --------------------
+    # -------------------- Email selection (BILL-TO-FIRST) --------------------
     buyer_email, buyer_email_source, buyer_email_debug = choose_order_email(order)
+    assert_invoice_email_choice(order, buyer_email, buyer_email_source, buyer_email_debug)
+    print(
+        f"→ Shopify invoice/customer email selected for PO {po_number}: {buyer_email!r} "
+        f"source={buyer_email_source} billToEmail={order.get('billToEmail')!r} "
+        f"shipToEmail={order.get('shipToEmail')!r}"
+    )
     if not buyer_email:
         print(f"⚠ No valid buyer email for PO {po_number}; customer lookup/create will proceed without email. Debug: {buyer_email_debug}")
 
@@ -1596,7 +1616,7 @@ for order in open_orders:
         _seen_pos.add(po_norm)
         continue
 
-    print(f"→ Creating Shopify draft order (GraphQL) for PO {po_number} / record {record_id} / email={buyer_email!r} source={buyer_email_source}")
+    print(f"→ Creating Shopify draft order (GraphQL) for PO {po_number} / record {record_id} / invoice_email={buyer_email!r} source={buyer_email_source}")
     try:
         draft_id = create_draft_order_graphql(order, customer_id, company_id, company_contact_id, company_location_id)
     except Exception as e:
