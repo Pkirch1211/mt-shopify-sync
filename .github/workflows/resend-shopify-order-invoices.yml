@@ -30,7 +30,7 @@ on:
       message:
         description: "Custom invoice message"
         required: true
-        default: "Hello — we are resending this invoice because the original invoice may have been sent to an outdated contact email. Please use this updated invoice link for payment. Thank you!"
+        default: "Hello - we are resending this invoice because the original invoice may have been sent to an outdated contact email. Please use this updated invoice link for payment. Thank you!"
 
 jobs:
   resend-order-invoices:
@@ -50,37 +50,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dotenv
 
-      - name: Build arguments
-        id: args
-        shell: bash
-        run: |
-          ARGS="--orders-file order_invoice_resend_list.txt"
-
-          if [ -n "${{ github.event.inputs.order_name }}" ]; then
-            ARGS="$ARGS --order-name '${{ github.event.inputs.order_name }}'"
-          fi
-
-          if [ "${{ github.event.inputs.mode }}" = "live" ]; then
-            ARGS="$ARGS --live"
-          fi
-
-          if [ "${{ github.event.inputs.include_paid }}" = "true" ]; then
-            ARGS="$ARGS --include-paid"
-          fi
-
-          ARGS="$ARGS --subject-prefix '${{ github.event.inputs.subject_prefix }}'"
-          ARGS="$ARGS --message '${{ github.event.inputs.message }}'"
-
-          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
-
       - name: Resend invoices
+        shell: bash
         env:
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_API_VERSION: "2024-10"
           DRY_RUN: ${{ github.event.inputs.mode == 'dry_run' && 'true' || 'false' }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_ORDER_NAME: ${{ github.event.inputs.order_name }}
+          INPUT_INCLUDE_PAID: ${{ github.event.inputs.include_paid }}
+          INPUT_SUBJECT_PREFIX: ${{ github.event.inputs.subject_prefix }}
+          INPUT_MESSAGE: ${{ github.event.inputs.message }}
         run: |
-          eval python resend_shopify_order_invoices.py ${{ steps.args.outputs.args }}
+          ARGS=(--orders-file order_invoice_resend_list.txt)
+
+          if [ -n "$INPUT_ORDER_NAME" ]; then
+            ARGS+=(--order-name "$INPUT_ORDER_NAME")
+          fi
+
+          if [ "$INPUT_MODE" = "live" ]; then
+            ARGS+=(--live)
+          fi
+
+          if [ "$INPUT_INCLUDE_PAID" = "true" ]; then
+            ARGS+=(--include-paid)
+          fi
+
+          ARGS+=(--subject-prefix "$INPUT_SUBJECT_PREFIX")
+          ARGS+=(--message "$INPUT_MESSAGE")
+
+          python resend_shopify_order_invoices.py "${ARGS[@]}"
 
       - name: Upload audit CSV
         uses: actions/upload-artifact@v4
