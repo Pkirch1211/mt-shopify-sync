@@ -1353,7 +1353,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
             f"No line items left for PO {order.get('poNumber')} after EOL SKU removal; skipping draft creation."
         )
 
-    tags = ["markettime", f"mt_recordID:{order.get('recordID')}"]
+    tags = ["markettime", "split0", f"mt_recordID:{order.get('recordID')}"]
     rep_group_id = order.get("repGroupID")
     if rep_group_id:
         tags.append(f"mt_repGroupID:{rep_group_id}")
