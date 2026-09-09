@@ -60,6 +60,21 @@ DISCOUNT_SKUS: set[str] = {
     "LL-16-3248", "LL-16-3249", "LL-16-3157", "LL-16-3158",
 }
 
+# -------------------- Needs-review thresholds --------------------
+# SKU-specific per-order quantity caps. If the TOTAL quantity of a flagged
+# SKU actually landing on the draft (post EOL removal, including any
+# quantity that arrives via assortment-child expansion) exceeds the cap,
+# the draft is tagged "needs-review" and a note is appended so a human
+# catches it before it ships. Add more entries here if other SKUs need
+# their own cap later -- keep it a dict so this isn't a one-off special case.
+NEEDS_REVIEW_TAG = "needs-review"
+SKU_QTY_REVIEW_THRESHOLDS: dict[str, tuple[int, str]] = {
+    # sku: (max_qty_before_flag, note_text)
+    "LL-00-0004": (4, "NEEDS REVIEW MAX SPINNER"),
+    "LL-99-0014": (4, "NEEDS REVIEW MAX CDU"),
+    "LL-99-3087": (4, "NEEDS REVIEW MAX CDU"),
+}
+
 # -------------------- Utilities --------------------
 def _t(label: str, start_ts: float | None):
     if LOG_TIMINGS and start_ts is not None:
@@ -1267,6 +1282,10 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
 
     line_items = []
     removed_eol_skus: list[tuple[str, int, str]] = []
+    # Running per-SKU quantity total across everything that actually ends up
+    # in line_items (post EOL removal, including assortment-child expansion).
+    # Used below to flag SKU_QTY_REVIEW_THRESHOLDS overages.
+    sku_qty_totals: dict[str, int] = {}
 
     for item in order.get("details", []) or []:
         sku = norm_sku(item.get("itemNumber"))
@@ -1319,6 +1338,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                         "taxable": True,
                     }
                 line_items.append(li)
+                sku_qty_totals[child_sku] = sku_qty_totals.get(child_sku, 0) + int(child_qty)
             continue
 
         # Normal (non-assortment) line (unchanged)
@@ -1343,6 +1363,7 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
                 "taxable": True,
             }
         line_items.append(li)
+        sku_qty_totals[sku] = sku_qty_totals.get(sku, 0) + qty
 
     if removed_eol_skus:
         removed_summary = ", ".join(f"{sku} x{qty} ({source})" for sku, qty, source in removed_eol_skus)
@@ -1353,7 +1374,26 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
             f"No line items left for PO {order.get('poNumber')} after EOL SKU removal; skipping draft creation."
         )
 
+    # --- SKU-specific needs-review quantity check ---
+    # Fires if the TOTAL quantity of a flagged SKU actually landing on this
+    # draft (see sku_qty_totals above) exceeds its configured threshold.
+    needs_review_flag = False
+    added_review_notes: set[str] = set()
+    for flagged_sku, (max_qty, review_note) in SKU_QTY_REVIEW_THRESHOLDS.items():
+        total_qty = sku_qty_totals.get(norm_sku(flagged_sku), 0)
+        if total_qty > max_qty:
+            print(
+                f"  · Flagging needs-review: {flagged_sku} qty={total_qty} exceeds "
+                f"threshold of {max_qty} on PO {order.get('poNumber')}"
+            )
+            if review_note not in added_review_notes:
+                note_parts.append(review_note)
+                added_review_notes.add(review_note)
+            needs_review_flag = True
+
     tags = ["markettime", "split0", f"mt_recordID:{order.get('recordID')}"]
+    if needs_review_flag:
+        tags.append(NEEDS_REVIEW_TAG)
     rep_group_id = order.get("repGroupID")
     if rep_group_id:
         tags.append(f"mt_repGroupID:{rep_group_id}")
