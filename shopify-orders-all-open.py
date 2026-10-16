@@ -1478,6 +1478,46 @@ def create_draft_order_graphql(order: dict, customer_id_numeric: int | str | Non
         raise RuntimeError("draftOrderCreate returned no draft id; full response: " + json.dumps(out, indent=2))
     return draft_id
 
+# -------------------- MT identifier metafields (mktt.*) --------------------
+# Written AFTER draft creation, one field per call, and never blocks the draft.
+# No "type" is sent: Shopify takes it from the draft order metafield definition
+# (e.g. mktt.recordid is Integer, mktt.repgroupid is Single line text).
+# If a key has no definition, Shopify returns a userError, which is logged and skipped.
+MT_METAFIELD_NAMESPACE = "mktt"
+MT_METAFIELD_MAP = (
+    # (MarketTime order field, metafield key)
+    ("recordID", "recordid"),
+    ("repGroupID", "repgroupid"),
+    ("retailerID", "retailerid"),
+    ("manufacturerID", "manufacturerid"),
+)
+
+def set_mt_metafields(draft_id: str, order: dict):
+    m = """
+    mutation($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { key value }
+        userErrors { field message code }
+      }
+    }"""
+    for mt_field, key in MT_METAFIELD_MAP:
+        val = str(order.get(mt_field) or "").strip()
+        if not val:
+            continue
+        mf = {"ownerId": draft_id, "namespace": MT_METAFIELD_NAMESPACE, "key": key, "value": val}
+        try:
+            out = shopify_graphql(m, {"metafields": [mf]})
+            if out.get("errors"):
+                print(f"(non-blocking) metafieldsSet {MT_METAFIELD_NAMESPACE}.{key} GraphQL errors: {out['errors']}")
+                continue
+            errs = (((out.get("data", {}) or {}).get("metafieldsSet", {}) or {}).get("userErrors", []) or [])
+            if errs:
+                print(f"(non-blocking) metafieldsSet {MT_METAFIELD_NAMESPACE}.{key}={val!r} userErrors: {errs}")
+            else:
+                print(f"  · Set {MT_METAFIELD_NAMESPACE}.{key} = {val}")
+        except Exception as e:
+            print(f"(non-blocking) metafieldsSet {MT_METAFIELD_NAMESPACE}.{key} failed: {e}")
+
 # -------------------- Customer search helpers --------------------
 def _lc(s: str | None) -> str:
     return (s or "").strip().lower()
@@ -1666,6 +1706,7 @@ for order in open_orders:
         continue
 
     print(f"✅ Draft order created for PO {po_number} → ID: {draft_id}")
+    set_mt_metafields(draft_id, order)
 
     exported_rows.append({
         "mt_recordID": record_id,
